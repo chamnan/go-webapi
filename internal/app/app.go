@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt" // For initial error printing and final logging
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,35 +12,30 @@ import (
 	"syscall"
 	"time"
 
+	"go-webapi/internal/bootstrap" // <-- Import bootstrap
 	"go-webapi/internal/config"
 	"go-webapi/internal/database"
-	"go-webapi/internal/handlers"
-	"go-webapi/internal/logging" // Need for logger setup helpers
-	"go-webapi/internal/repositories"
-	routes "go-webapi/internal/routes" // <-- Import for routes
-	"go-webapi/internal/services"
+	"go-webapi/internal/logging"
+	routes "go-webapi/internal/routes"
 
 	"github.com/gofiber/contrib/fiberzap/v2"
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors" // <-- CORS middleware import
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore" // Import zapcore for manual core setup
 )
 
 // Run initializes and starts the application
 func Run() {
 	// Declare variables early
 	var baseLogger *zap.Logger
-	var finalLogger *zap.Logger
-	var logProcessor *logging.LogProcessor
+	var finalLogger *zap.Logger // Will be initialized by bootstrap
 	var oracleDB *sql.DB
 	var sqliteDB *sql.DB
 	var cfg *config.Config
 	var err error
-	var logRepo repositories.LogRepository
-	var userRepo repositories.UserRepository
 	var app *fiber.App
+	var components *bootstrap.AppComponents
 
 	// --- Load Configuration ---
 	cfg, err = config.LoadConfig(nil)
@@ -50,13 +45,13 @@ func Run() {
 	}
 
 	// --- Initialize Base Logger (File/Console) ---
+	// Used for DB init and passed to bootstrap
 	baseLogger, err = logging.InitFileConsoleLogger(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to initialize base logger: %v\n", err)
 		os.Exit(1)
 	}
 	baseLogger.Info("Base file/console logger initialized.")
-	finalLogger = baseLogger // Temporarily assign baseLogger, will be replaced
 
 	// --- Initialize SQLite Database ---
 	sqliteDB, err = database.InitSQLite(cfg, baseLogger)
@@ -65,52 +60,33 @@ func Run() {
 	}
 	baseLogger.Info("SQLite database initialized successfully.")
 
-	// --- Initialize Oracle DB Handle (Non-blocking Setup) ---
+	// --- Initialize Oracle DB Handle ---
 	oracleDB, err = database.InitOracle(cfg, baseLogger)
 	if err != nil {
+		// Log with baseLogger as finalLogger isn't ready
 		baseLogger.Error("Error during Oracle DB pool initialization (continuing)", zap.Error(err))
 	} else if oracleDB != nil {
 		baseLogger.Info("Oracle database pool initialized.")
 	}
 
-	// --- Initialize Repositories ---
-	logRepo = repositories.NewLogRepository(sqliteDB, oracleDB, baseLogger)
-	userRepo = repositories.NewOracleUserRepository(oracleDB, baseLogger)
-
-	// --- Setup Final Logger with SQLite Core ---
-	// Assuming CreateFileConsoleEncoderConfigs, CreateFileConsoleWriteSyncers, NewSQLiteCore are exported from logging
-	logLevel := zapcore.InfoLevel
-	if cfg.AppEnv == "local" || cfg.AppEnv == "development" {
-		logLevel = zapcore.DebugLevel
-	}
-	consoleEncoderCfg, fileEncoderCfg := logging.CreateFileConsoleEncoderConfigs()
-	consoleWriter, fileWriter, err := logging.CreateFileConsoleWriteSyncers(cfg)
+	// Call bootstrap function, passing baseLogger and DB handles
+	components, finalLogger, err = bootstrap.InitializeAppComponents(cfg, baseLogger, sqliteDB, oracleDB)
 	if err != nil {
-		baseLogger.Fatal("Failed to recreate file/console writers for final logger", zap.Error(err))
+		// Use baseLogger for fatal error as finalLogger might not be valid
+		baseLogger.Fatal("Failed to initialize application components", zap.Error(err))
 	}
-	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleWriter, logLevel)
-	fileCore := zapcore.NewCore(zapcore.NewJSONEncoder(fileEncoderCfg), fileWriter, logLevel)
-	sqliteEncoderCfg := fileEncoderCfg
-	sqliteJSONEncoder := zapcore.NewJSONEncoder(sqliteEncoderCfg)
-	sqliteCore := logging.NewSQLiteCore(logLevel, sqliteJSONEncoder, sqliteEncoderCfg, logRepo)
 
-	finalTeeCore := zapcore.NewTee(consoleCore, fileCore, sqliteCore)
-	finalLogger = zap.New(finalTeeCore, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
-	finalLogger.Info("Final logger initialized with Console, File, and SQLite destinations.")
-	logging.SetGlobalLogger(finalLogger) // Set the logger globally
-
-	// --- Initialize Services, Handlers, Processor ---
-	authService := services.NewAuthService(userRepo, finalLogger, cfg.JWTSecret)
-	profileService := services.NewProfileService(userRepo, finalLogger)
-	authHandler := handlers.NewAuthHandler(authService, finalLogger, cfg.UploadDir)
-	profileHandler := handlers.NewProfileHandler(profileService, finalLogger)
-	logProcessor = logging.NewLogProcessor(cfg, logRepo, finalLogger)
+	// Update global logger with the fully configured finalLogger
+	logging.SetGlobalLogger(finalLogger)
+	// Get log processor for shutdown step
+	logProcessor := components.LogProcessor
 
 	// --- Initialize Fiber App ---
+	// Use finalLogger for Fiber setup and error handling
 	finalLogger.Info("Initializing Fiber application...")
 	app = fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
-			lg := logging.GetLogger() // Use the globally set logger
+			lg := logging.GetLogger() // Get the globally set finalLogger
 			code := fiber.StatusInternalServerError
 			var e *fiber.Error
 			if errors.As(err, &e) {
@@ -134,6 +110,7 @@ func Run() {
 	})
 
 	// --- Middleware ---
+	// Use finalLogger where needed
 	app.Use(recover.New(recover.Config{EnableStackTrace: cfg.AppEnv != "production", StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
 		logging.GetLogger().Error("Panic recovered", zap.Any("panic_value", e), zap.Stack("stacktrace"))
 	}}))
@@ -142,15 +119,27 @@ func Run() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH",
 	}))
+	// Pass the finalLogger returned by bootstrap to FiberZap
 	app.Use(fiberzap.New(fiberzap.Config{Logger: finalLogger, Fields: []string{"status", "method", "url", "ip", "latency", "error"}, Next: func(c *fiber.Ctx) bool { return c.Path() == "/health" || strings.HasPrefix(c.Path(), "/uploads") }}))
 
 	// --- Routes ---
-	routes.SetupRoutes(app, cfg, finalLogger, authHandler, profileHandler, sqliteDB, oracleDB)
+	// Pass handlers from components struct and finalLogger
+	routes.SetupRoutes(
+		app,
+		cfg,
+		finalLogger, // Pass the initialized final logger
+		components,
+		sqliteDB,
+		oracleDB,
+	)
 
 	// --- Start Log Processor ---
-	logProcessor.Start()
+	if logProcessor != nil {
+		logProcessor.Start()
+	}
 
 	// --- Start Server & Graceful Shutdown ---
+	// Use finalLogger for lifecycle logs
 	serverCtx, cancelServerCtx := context.WithCancel(context.Background())
 	defer cancelServerCtx()
 	serverStopped := make(chan struct{})
@@ -178,6 +167,7 @@ func Run() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancelShutdown()
 
+	// Shutdown sequence (using finalLogger until DBs are closed)
 	// 1. Stop Log Processor
 	if logProcessor != nil {
 		finalLogger.Info("Stopping log processor...")
@@ -193,42 +183,35 @@ func Run() {
 		finalLogger.Info("Fiber server gracefully stopped.")
 	}
 
-	// 3. Wait for the listener goroutine to stop
+	// 3. Wait for listener
 	<-serverStopped
-	finalLogger.Info("HTTP listener stopped.") // <-- Still safe, DBs are open
+	finalLogger.Info("HTTP listener stopped.")
 
-	// 4. Flush logger buffers (attempt to write pending logs before closing DB)
-	finalLogger.Info("Syncing logger...") // <-- Still safe, DBs are open
-	_ = finalLogger.Sync()                // Ignore sync error, might happen in abrupt shutdown
-	// finalLogger.Info("Logger sync completed.") // <-- Let's move this after DB close using fmt
+	// 4. Sync Logger
+	finalLogger.Info("Syncing logger...")
+	_ = finalLogger.Sync() // Use finalLogger here
 
-	// 5. Close Database Connections
+	// 5. Close Databases
 	if sqliteDB != nil {
-		finalLogger.Info("Closing SQLite database connection...") // <-- Log BEFORE closing
+		finalLogger.Info("Closing SQLite database connection...") // Use finalLogger
 		if err := sqliteDB.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "[ERROR] Error closing SQLite database: %v\n", err)
-			// baseLogger might be safer here if it ONLY writes to console/file
-			// baseLogger.Error("Error closing SQLite database", zap.Error(err))
 		} else {
-			// Use fmt.Println instead of finalLogger AFTER closing
-			fmt.Println("***[INFO] SQLite database connection closed.") // <-- MODIFIED
+			fmt.Println("[INFO] SQLite database connection closed.")
 		}
 	}
-
 	if oracleDB != nil {
-		finalLogger.Info("Closing Oracle database pool...") // <-- Log BEFORE closing (safe)
+		finalLogger.Info("Closing Oracle database pool...") // Use finalLogger
 		if err := oracleDB.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "[ERROR] Error closing Oracle database pool: %v\n", err)
-			// baseLogger.Error("Error closing Oracle database pool", zap.Error(err))
 		} else {
-			// Use fmt.Println instead of finalLogger AFTER closing
-			fmt.Println("***[INFO] Oracle database pool closed.") // <-- MODIFIED
+			fmt.Println("[INFO] Oracle database pool closed.")
 		}
 	}
 
-	// Log sync completion and final message using fmt.Println
-	fmt.Println("***[INFO] Logger sync attempt completed.") // <-- MODIFIED (moved and changed)
-	fmt.Println("***[INFO] Application shutdown complete.") // <-- MODIFIED
+	fmt.Println("[INFO] Logger sync attempt completed.")
+	fmt.Println("[INFO] Application shutdown complete.")
 }
 
-// NOTE: Ensure logging helpers are exported as mentioned before.
+// NOTE: Ensure logging helpers (CreateFileConsoleEncoderConfigs, CreateFileConsoleWriteSyncers, NewSQLiteCore)
+// are EXPORTED from the logging package for use in bootstrap.go.
