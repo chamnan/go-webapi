@@ -14,9 +14,9 @@ import (
 	"go-webapi/internal/models"
 	"go-webapi/internal/repositories"
 
+	"github.com/DeRuina/timberjack"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -24,7 +24,6 @@ var (
 	globalMu     sync.RWMutex // Mutex to protect globalLogger
 )
 
-// --- EXPORTED Encoders Helper ---
 // CreateFileConsoleEncoderConfigs creates standard encoder configs for console and file.
 func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderConfig) {
 	// Console Encoder (human-readable, colored)
@@ -42,7 +41,6 @@ func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderCo
 	return consoleEncoderCfg, fileEncoderCfg
 }
 
-// --- EXPORTED Write Syncers Helper ---
 // CreateFileConsoleWriteSyncers creates standard write syncers for console and file using lumberjack.
 func CreateFileConsoleWriteSyncers(cfg *config.Config) (zapcore.WriteSyncer, zapcore.WriteSyncer, error) {
 	// Console Writer
@@ -56,13 +54,14 @@ func CreateFileConsoleWriteSyncers(cfg *config.Config) (zapcore.WriteSyncer, zap
 		// return nil, nil, fmt.Errorf("failed to create log directory %s: %w", filepath.Dir(cfg.LogFilePath), err)
 	}
 
-	fileWriter := zapcore.AddSync(&lumberjack.Logger{
-		Filename:   cfg.LogFilePath,   // Path from config
-		MaxSize:    cfg.LogMaxSize,    // Max size in MB from config
-		MaxBackups: cfg.LogMaxBackups, // Max backup files from config
-		MaxAge:     cfg.LogMaxAge,     // Max days to retain from config
-		Compress:   cfg.LogCompress,   // Compress flag from config
-		LocalTime:  true,              // Use local time for backup filenames
+	fileWriter := zapcore.AddSync(&timberjack.Logger{ // <-- Change lumberjack to timberjack here
+		Filename:         cfg.LogFilePath,                                  // Path from config
+		MaxSize:          cfg.LogMaxSize,                                   // Max size in MB from config
+		MaxBackups:       cfg.LogMaxBackups,                                // Max backup files from config
+		MaxAge:           cfg.LogMaxAge,                                    // Max days to retain from config
+		Compress:         cfg.LogCompress,                                  // Compress flag from config
+		LocalTime:        true,                                             // Use local time for backup filenames
+		RotationInterval: time.Duration(cfg.LogRotateInterval) * time.Hour, // Rotate every x hours from config
 	})
 
 	return consoleWriter, fileWriter, nil
@@ -104,6 +103,7 @@ func InitFileConsoleLogger(cfg *config.Config) (*zap.Logger, error) {
 		zap.String("effectiveLevel", logLevel.String()),
 		zap.String("logFile", cfg.LogFilePath),
 		zap.String("logMaxSize", strconv.Itoa(cfg.LogMaxSize)),
+		zap.String("logRotationInterval", strconv.Itoa(cfg.LogRotateInterval)),
 	)
 
 	return logger, nil

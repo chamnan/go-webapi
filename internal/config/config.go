@@ -27,6 +27,7 @@ type Config struct {
 	SQLiteDBPath                        string
 	LogFilePath                         string
 	LogLevel                            string
+	LogRotateInterval                   int // Hour
 	LogMaxSize                          int // MB
 	LogMaxBackups                       int
 	LogMaxAge                           int // Days
@@ -96,14 +97,15 @@ func LoadConfig(logger *zap.Logger) (*Config, error) { // logger can be nil here
 		OracleMaxPoolConnLifetimeMinutes: getEnvAsInt("ORACLE_MAX_POOL_CONN_LIFETIME_MINUTES", 60),  // Default 60 (1 hour)
 		OracleMaxPoolConnIdleTimeMinutes: getEnvAsInt("ORACLE_MAX_POOL_CONN_IDLE_TIME_MINUTES", 10), // Default 10
 		// --- End Load Oracle Settings ---
-		SQLiteDBPath:  getEnv("SQLITE_DB_PATH", "./logs/logs.db"),
-		LogFilePath:   getEnv("LOG_FILE_PATH", "./logs/app.log"),
-		LogLevel:      strings.ToLower(getEnv("LOG_LEVEL", "info")),
-		LogMaxSize:    getEnvAsInt("LOG_MAX_SIZE", 100),
-		LogMaxBackups: getEnvAsInt("LOG_MAX_BACKUPS", 5),
-		LogMaxAge:     getEnvAsInt("LOG_MAX_AGE", 30),
-		LogCompress:   getEnvAsBool("LOG_COMPRESS", false),
-		UploadDir:     getEnv("UPLOAD_DIR", "./uploads"),
+		SQLiteDBPath:      getEnv("SQLITE_DB_PATH", "./logs/logs.db"),
+		LogFilePath:       getEnv("LOG_FILE_PATH", "./logs/app.log"),
+		LogLevel:          strings.ToLower(getEnv("LOG_LEVEL", "info")),
+		LogRotateInterval: getEnvAsInt("LOG_ROTATE_INTERVAL", 1),
+		LogMaxSize:        getEnvAsInt("LOG_MAX_SIZE", 100),
+		LogMaxBackups:     getEnvAsInt("LOG_MAX_BACKUPS", 5),
+		LogMaxAge:         getEnvAsInt("LOG_MAX_AGE", 30),
+		LogCompress:       getEnvAsBool("LOG_COMPRESS", false),
+		UploadDir:         getEnv("UPLOAD_DIR", "./uploads"),
 
 		// --- Load CORS Settings ---
 		// Default AllowOrigins to "*" for local, empty for others (forcing explicit setting)

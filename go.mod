@@ -3,6 +3,7 @@ module go-webapi
 go 1.24.2
 
 require (
+	github.com/DeRuina/timberjack v1.0.0
 	github.com/godror/godror v0.48.1 // Or latest stable Oracle driver
 	github.com/gofiber/contrib/fiberzap/v2 v2.1.6
 	github.com/gofiber/fiber/v2 v2.52.6 // Use specific version or latest stable
@@ -12,7 +13,6 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.28 // Or latest stable SQLite driver
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.37.0
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (
