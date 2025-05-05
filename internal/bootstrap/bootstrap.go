@@ -42,10 +42,13 @@ func InitializeAppComponents(
 
 	// --- 2. Setup Final Logger (including SQLite Core) ---
 	// This depends on logRepo being initialized
-	logLevel := zapcore.InfoLevel
-	if cfg.AppEnv == "local" || cfg.AppEnv == "development" {
-		logLevel = zapcore.DebugLevel
+	var logLevel zapcore.Level
+	err := logLevel.UnmarshalText([]byte(cfg.LogLevel)) // Parse level from config string
+	if err != nil {
+		baseLogger.Warn("Invalid log level..., defaulting to info")
+		logLevel = zapcore.InfoLevel // Default to Info on parsing error
 	}
+
 	// Assume these helpers are exported from logging package
 	consoleEncoderCfg, fileEncoderCfg := logging.CreateFileConsoleEncoderConfigs()
 	consoleWriter, fileWriter, err := logging.CreateFileConsoleWriteSyncers(cfg)

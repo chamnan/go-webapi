@@ -25,12 +25,18 @@ func InitOracle(cfg *config.Config, logger *zap.Logger) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to configure oracle connection pool: %w", err)
 	}
 
-	// Configure connection pool (adjust as needed)
-	// These settings control how the pool manages connections over time.
-	db.SetMaxOpenConns(20)                  // Max number of open connections
-	db.SetMaxIdleConns(5)                   // Max number of connections kept idle
-	db.SetConnMaxLifetime(time.Hour)        // Max time a connection can be reused
-	db.SetConnMaxIdleTime(10 * time.Minute) // Max time a connection can be idle
+	// --- Configure connection pool
+	logger.Debug("Applying Oracle pool settings",
+		zap.Int("MaxOpenConns", cfg.OracleMaxPoolOpenConns),
+		zap.Int("MaxIdleConns", cfg.OracleMaxPoolIdleConns),
+		zap.Int("ConnMaxLifetimeMinutes", cfg.OracleMaxPoolConnLifetimeMinutes),
+		zap.Int("ConnMaxIdleTimeMinutes", cfg.OracleMaxPoolConnIdleTimeMinutes),
+	)
+	db.SetMaxOpenConns(cfg.OracleMaxPoolOpenConns)
+	db.SetMaxIdleConns(cfg.OracleMaxPoolIdleConns)
+	db.SetConnMaxLifetime(time.Duration(cfg.OracleMaxPoolConnLifetimeMinutes) * time.Minute) // Convert minutes to duration
+	db.SetConnMaxIdleTime(time.Duration(cfg.OracleMaxPoolConnIdleTimeMinutes) * time.Minute) // Convert minutes to duration
+	// --- End Pool Configuration ---
 
 	// Optional: Perform an initial ping to check immediate connectivity.
 	// This might block briefly. You can skip this if faster startup is critical.

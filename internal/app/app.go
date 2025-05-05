@@ -114,11 +114,18 @@ func Run() {
 	app.Use(recover.New(recover.Config{EnableStackTrace: cfg.AppEnv != "production", StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
 		logging.GetLogger().Error("Panic recovered", zap.Any("panic_value", e), zap.Stack("stacktrace"))
 	}}))
+	// --- CORS Middleware
+	finalLogger.Info("Configuring CORS",
+		zap.String("origins", cfg.CORSAllowOrigins),
+		zap.String("methods", cfg.CORSAllowMethods),
+		zap.String("headers", cfg.CORSAllowHeaders))
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*", // IMPORTANT: Restrict this in production
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
-		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH",
+		AllowOrigins: cfg.CORSAllowOrigins, // Use value from config
+		AllowMethods: cfg.CORSAllowMethods, // Use value from config
+		AllowHeaders: cfg.CORSAllowHeaders, // Use value from config
+		// AllowCredentials: true, // Add if you need cookies/auth headers from cross-origin requests
 	}))
+	// --- End CORS Middleware ---
 	// Pass the finalLogger returned by bootstrap to FiberZap
 	app.Use(fiberzap.New(fiberzap.Config{Logger: finalLogger, Fields: []string{"status", "method", "url", "ip", "latency", "error"}, Next: func(c *fiber.Ctx) bool { return c.Path() == "/health" || strings.HasPrefix(c.Path(), "/uploads") }}))
 

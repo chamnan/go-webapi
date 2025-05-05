@@ -12,15 +12,9 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	batchSize           = 100              // Number of logs to fetch and insert in one batch
-	oracleRetryAttempts = 3                // Max attempts to insert THIS BATCH if Oracle connection fails
-	oracleRetryDelay    = 30 * time.Second // Retry delay for THIS BATCH after connection error
-)
-
 // LogProcessor handles the transfer of logs from SQLite to Oracle
 type LogProcessor struct {
-	cfg       *config.Config // Keep config for InitOracle
+	cfg       *config.Config
 	logRepo   repositories.LogRepository
 	logger    *zap.Logger
 	ticker    *time.Ticker
@@ -44,10 +38,15 @@ func (p *LogProcessor) Start() {
 		p.logger.Warn("Log processor already running")
 		return
 	}
-	p.ticker = time.NewTicker(p.cfg.LogBatchInterval) // Main interval for checking SQLite
+	p.ticker = time.NewTicker(p.cfg.LogBatchInterval)
 	p.isRunning = true
 	go p.run()
-	p.logger.Info("SQLite to Oracle log processor started", zap.Duration("interval", p.cfg.LogBatchInterval))
+	p.logger.Info("SQLite to Oracle log processor started",
+		zap.Duration("interval", p.cfg.LogBatchInterval),
+		zap.Int("batchSize", p.cfg.LogProcessorBatchSize),
+		zap.Int("retryAttempts", p.cfg.LogProcessorOracleRetryAttempts),
+		zap.Int("retryDelaySec", p.cfg.LogProcessorOracleRetryDelaySeconds),
+	)
 }
 
 // Stop signals the log processing loop to terminate gracefully
@@ -57,10 +56,8 @@ func (p *LogProcessor) Stop() {
 		return
 	}
 	p.logger.Info("Stopping SQLite to Oracle log processor...")
-	// Ensure stopChan is valid before closing
 	select {
 	case <-p.stopChan:
-		// Already closed
 	default:
 		close(p.stopChan)
 	}
@@ -68,13 +65,13 @@ func (p *LogProcessor) Stop() {
 		p.ticker.Stop()
 	}
 	p.isRunning = false
-	// Wait briefly allows run() goroutine to exit gracefully after receiving signal
 	time.Sleep(500 * time.Millisecond)
 	p.logger.Info("Processing final log batch before shutdown...")
-	// Allow slightly more time than a single retry delay
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), oracleRetryDelay+5*time.Second)
+	oracleRetryDelayDuration := time.Duration(p.cfg.LogProcessorOracleRetryDelaySeconds) * time.Second
+	shutdownCtxTimeout := oracleRetryDelayDuration + (5 * time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownCtxTimeout)
 	defer cancel()
-	p.processBatch(shutdownCtx) // Attempt one last batch
+	p.processBatch(shutdownCtx)
 	p.logger.Info("Log processor stopped.")
 }
 
@@ -83,18 +80,19 @@ func (p *LogProcessor) run() {
 	for {
 		select {
 		case <-p.ticker.C:
-			// Check if stopped before processing
 			select {
 			case <-p.stopChan:
 				p.logger.Info("Stop signal received before processing tick, exiting loop.")
 				return
 			default:
-				// Continue processing
+				tickCtxTimeout := p.cfg.LogBatchInterval - (1 * time.Second)
+				if tickCtxTimeout <= 0 {
+					tickCtxTimeout = 30 * time.Second
+				}
+				tickCtx, cancel := context.WithTimeout(context.Background(), tickCtxTimeout)
+				p.processBatch(tickCtx)
+				cancel()
 			}
-			// Use a context for the entire batch processing attempt for this tick
-			tickCtx, cancel := context.WithTimeout(context.Background(), p.cfg.LogBatchInterval-1*time.Second)
-			p.processBatch(tickCtx)
-			cancel()
 		case <-p.stopChan:
 			p.logger.Info("Received stop signal, exiting log processing loop.")
 			return
@@ -103,13 +101,13 @@ func (p *LogProcessor) run() {
 }
 
 // processBatch fetches logs from SQLite, attempts to insert them into Oracle.
-// If Oracle connection handle is nil or insert fails due to connection issue,
-// it attempts to initialize/reinitialize the connection and updates the repo.
 func (p *LogProcessor) processBatch(ctx context.Context) {
 	p.logger.Debug("Processing log batch...")
 
+	oracleRetryDelayDuration := time.Duration(p.cfg.LogProcessorOracleRetryDelaySeconds) * time.Second
+
 	// 1. Get logs from SQLite
-	logs, err := p.logRepo.GetSQLiteLogs(ctx, batchSize)
+	logs, err := p.logRepo.GetSQLiteLogs(ctx, p.cfg.LogProcessorBatchSize)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			p.logger.Info("Context cancelled/timed out during SQLite fetch.", zap.Error(err))
@@ -127,31 +125,29 @@ func (p *LogProcessor) processBatch(ctx context.Context) {
 	// 2. Attempt to insert logs into Oracle with init/retry logic
 	var insertErr error
 	success := false
-	for attempt := 1; attempt <= oracleRetryAttempts; attempt++ {
+	// *** CORRECTED LOOP: Start at 1, use <= for condition ***
+	for attempt := 1; attempt <= p.cfg.LogProcessorOracleRetryAttempts; attempt++ {
 		// Check context before attempt
 		if ctx.Err() != nil {
-			p.logger.Info("Context cancelled before Oracle insert attempt.", zap.Error(ctx.Err()))
 			insertErr = ctx.Err()
 			break
 		}
 		select {
 		case <-p.stopChan:
-			p.logger.Info("Stop signal received before Oracle insert attempt.")
 			insertErr = errors.New("processor stopped")
-			goto StopProcessing // Use goto to break outer logic flow cleanly
+			goto StopProcessing
 		default:
 		}
 
-		// --- Attempt insert ---
-		// Use a shorter timeout for the actual DB operation within the overall tick context
-		insertCtx, cancelInsert := context.WithTimeout(ctx, 45*time.Second) // Timeout for this attempt
+		// Attempt insert
+		insertCtx, cancelInsert := context.WithTimeout(ctx, 45*time.Second)
 		insertErr = p.logRepo.InsertBatchOracle(insertCtx, logs)
-		cancelInsert() // Cancel insert context immediately after return
+		cancelInsert()
 
 		if insertErr == nil {
 			p.logger.Debug("Successfully inserted log batch into Oracle", zap.Int("count", len(logs)), zap.Int("attempt", attempt))
 			success = true
-			break // Exit retry loop
+			break // Exit retry loop on success
 		}
 
 		// --- Handle Insert Error ---
@@ -159,59 +155,53 @@ func (p *LogProcessor) processBatch(ctx context.Context) {
 
 		// Check context/stop signal again after failed attempt
 		if ctx.Err() != nil {
-			p.logger.Info("Context cancelled after Oracle insert attempt failed.", zap.Error(ctx.Err()))
 			insertErr = ctx.Err()
 			break
 		}
 		select {
 		case <-p.stopChan:
-			p.logger.Info("Stop signal received after Oracle insert attempt failed.")
 			insertErr = errors.New("processor stopped")
 			goto StopProcessing
 		default:
 		}
 
 		// --- Decide whether to retry or give up ---
-		if isConnError && attempt <= oracleRetryAttempts {
-			p.logger.Warn("Oracle insert failed (connection issue), attempting to establish/verify connection before retry...",
+		// *** CORRECTED CONDITION: Use '<' to check if MORE retries are possible ***
+		if isConnError && attempt < p.cfg.LogProcessorOracleRetryAttempts {
+			// Log message BEFORE attempting the next retry
+			p.logger.Warn("Oracle insert failed (connection issue), will attempt recovery and retry.",
 				zap.Error(insertErr),
-				zap.Int("attempt", attempt),
-				zap.Int("max_attempts", oracleRetryAttempts),
+				zap.Int("attempt_failed", attempt), // Log the attempt number that just failed
+				zap.Int("next_attempt", attempt+1), // Log the upcoming attempt number
+				zap.Int("max_attempts", p.cfg.LogProcessorOracleRetryAttempts),
 			)
 
-			// === Attempt to Init/Re-init Oracle Connection ===
-			// Call simplified InitOracle which just sets up pool handle
+			// Attempt to Init/Re-init Oracle Connection
 			p.logger.Info("Processor attempting to initialize/re-initialize Oracle connection...")
-			newDb, initErr := database.InitOracle(p.cfg, p.logger) // Assumes InitOracle is quick
-
+			newDb, initErr := database.InitOracle(p.cfg, p.logger)
 			if initErr == nil && newDb != nil {
-				// Ping the new handle to be more certain before updating
 				pingCtx, cancelPing := context.WithTimeout(context.Background(), 10*time.Second)
 				pingErr := newDb.PingContext(pingCtx)
 				cancelPing()
-
 				if pingErr == nil {
-					p.logger.Info("Successfully established/verified Oracle connection via processor.", zap.Int("attempt", attempt))
-					// Update the SHARED repository handle - REQUIRES SetOracleDB on repo + mutex
+					p.logger.Info("Successfully established/verified Oracle connection via processor.", zap.Int("attempt_failed", attempt))
 					p.logRepo.SetOracleDB(newDb)
-					p.logger.Warn("Processor updated shared Oracle DB handle. Ensure other components (e.g., UserRepository) are aware or updated if necessary.")
+					p.logger.Warn("Processor updated shared Oracle DB handle.")
 				} else {
-					p.logger.Error("Processor initialized Oracle handle, but immediate ping failed.", zap.Error(pingErr), zap.Int("attempt", attempt))
-					newDb.Close() // Close the handle if ping failed
+					p.logger.Error("Processor initialized Oracle handle, but immediate ping failed.", zap.Error(pingErr), zap.Int("attempt_failed", attempt))
+					newDb.Close()
 				}
 			} else {
-				//p.logger.Error("Processor failed to initialize Oracle connection", zap.Error(initErr), zap.Int("attempt", attempt))
 				if newDb != nil {
 					newDb.Close()
-				} // Close if Open succeeded but Ping failed within InitOracle
+				}
 			}
-			// === End Connection Attempt ===
 
-			p.logger.Info("Waiting before retrying Oracle insert...", zap.Duration("retry_delay", oracleRetryDelay))
-			// Wait for the specific retry delay, respecting context cancellation and stopChan
+			// Wait before next attempt
+			p.logger.Info("Waiting before next Oracle insert attempt...", zap.Duration("retry_delay", oracleRetryDelayDuration))
 			select {
-			case <-time.After(oracleRetryDelay):
-				continue // Retry the insert attempt
+			case <-time.After(oracleRetryDelayDuration):
+				continue // Go to the next iteration (attempt will increment)
 			case <-ctx.Done():
 				p.logger.Info("Parent context cancelled during Oracle retry wait.", zap.Error(ctx.Err()))
 				insertErr = ctx.Err()
@@ -221,16 +211,23 @@ func (p *LogProcessor) processBatch(ctx context.Context) {
 				insertErr = errors.New("processor stopped")
 				goto StopProcessing
 			}
-		} else { // Error is not connection error OR max retries reached
-			if isConnError {
-				p.logger.Error("Oracle insert failed after max retries for connection issue", zap.Error(insertErr), zap.Int("attempts", attempt))
-			} else {
-				p.logger.Error("Oracle insert failed (non-connection/non-retryable error?)", zap.Error(insertErr), zap.Int("attempt", attempt))
+		} else {             // Error is not connection error OR this was the final attempt (attempt == max_attempts)
+			if isConnError { // Log specific message for max retries reached on connection error
+				p.logger.Error("Oracle insert failed after max retries for connection issue",
+					zap.Error(insertErr),
+					zap.Int("attempts_made", attempt), // Use 'attempt' which equals max_attempts here
+					zap.Int("max_attempts", p.cfg.LogProcessorOracleRetryAttempts),
+				)
+			} else { // Log message for non-connection errors
+				p.logger.Error("Oracle insert failed (non-connection/non-retryable error?)",
+					zap.Error(insertErr),
+					zap.Int("attempt_failed", attempt), // Log the attempt number that failed
+				)
 			}
-			break // Exit retry loop
+			break // Exit retry loop, no more retries
 		}
 	}
-StopProcessing: // Label for goto
+StopProcessing: // Label for goto jumps when context/stop occurs during wait
 
 	// 3. Check if insert eventually succeeded
 	if !success {
@@ -243,14 +240,12 @@ StopProcessing: // Label for goto
 	for i, log := range logs {
 		logIDs[i] = log.ID
 	}
-
-	// Reuse parent ctx for deletion
 	err = p.logRepo.DeleteSQLiteLogsByID(ctx, logIDs)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			p.logger.Warn("Context cancelled/timed out during SQLite delete.", zap.Error(err), zap.Int("count", len(logIDs)))
 		} else {
-			p.logger.Error("CRITICAL: Failed to delete logs from SQLite after successful Oracle insert. Logs are duplicated.", zap.Error(err), zap.Int64s("log_ids", logIDs))
+			p.logger.Error("CRITICAL: Failed to delete logs from SQLite after successful Oracle insert.", zap.Error(err), zap.Int64s("log_ids", logIDs))
 		}
 		return
 	}
