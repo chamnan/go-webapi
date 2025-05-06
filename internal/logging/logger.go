@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
 	"sync" // Import sync for mutex
 	"time"
 
@@ -14,7 +12,6 @@ import (
 	"go-webapi/internal/models"
 	"go-webapi/internal/repositories"
 
-	"github.com/DeRuina/timberjack"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -41,69 +38,43 @@ func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderCo
 	return consoleEncoderCfg, fileEncoderCfg
 }
 
-// CreateFileConsoleWriteSyncers creates standard write syncers for console and file using lumberjack.
-func CreateFileConsoleWriteSyncers(cfg *config.Config) (zapcore.WriteSyncer, zapcore.WriteSyncer, error) {
-	// Console Writer
-	consoleWriter := zapcore.Lock(os.Stdout)
-
-	// Rotating File Writer using lumberjack
-	// Ensure the directory exists (handled in config loading, but good practice)
-	if err := os.MkdirAll(filepath.Dir(cfg.LogFilePath), 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating log directory for lumberjack: %v\n", err)
-		// Decide if this is fatal or if logging can continue to console only
-		// return nil, nil, fmt.Errorf("failed to create log directory %s: %w", filepath.Dir(cfg.LogFilePath), err)
-	}
-
-	fileWriter := zapcore.AddSync(&timberjack.Logger{ // <-- Change lumberjack to timberjack here
-		Filename:         cfg.LogFilePath,                                  // Path from config
-		MaxSize:          cfg.LogMaxSize,                                   // Max size in MB from config
-		MaxBackups:       cfg.LogMaxBackups,                                // Max backup files from config
-		MaxAge:           cfg.LogMaxAge,                                    // Max days to retain from config
-		Compress:         cfg.LogCompress,                                  // Compress flag from config
-		LocalTime:        true,                                             // Use local time for backup filenames
-		RotationInterval: time.Duration(cfg.LogRotateInterval) * time.Hour, // Rotate every x hours from config
-	})
-
-	return consoleWriter, fileWriter, nil
-}
-
 // InitFileConsoleLogger initializes a Zap logger with only File and Console outputs.
-// It now respects the LogLevel set in the configuration.
-func InitFileConsoleLogger(cfg *config.Config) (*zap.Logger, error) {
+// MODIFIED: Accepts the shared fileSyncer
+func InitFileConsoleLogger(cfg *config.Config, fileSyncer zapcore.WriteSyncer) (*zap.Logger, error) {
 
 	// --- Determine Log Level from Config ---
 	var logLevel zapcore.Level
 	// Use Zap's built-in unmarshaler for robustness
 	if err := logLevel.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+		// Log warning to stderr as logger isn't fully built yet
 		fmt.Fprintf(os.Stderr, "[WARN] Invalid LOG_LEVEL '%s' for base logger, defaulting to info: %v\n", cfg.LogLevel, err)
 		logLevel = zapcore.InfoLevel // Default to Info level on error
 	}
 	// --- End Log Level Determination ---
 
-	// Use exported helpers
+	// Use exported helpers for encoders
 	consoleEncoderCfg, fileEncoderCfg := CreateFileConsoleEncoderConfigs()
-	consoleWriter, fileWriter, err := CreateFileConsoleWriteSyncers(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create file/console writers for base logger: %w", err)
-	}
 
-	// Create cores using the determined logLevel
-	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleWriter, logLevel)
-	fileCore := zapcore.NewCore(zapcore.NewJSONEncoder(fileEncoderCfg), fileWriter, logLevel)
+	// Create Console Syncer ONLY
+	consoleSyncer := zapcore.Lock(os.Stdout)
+
+	// Create Cores using the determined logLevel and the PASSED-IN fileSyncer
+	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleSyncer, logLevel)
+	fileCore := zapcore.NewCore(zapcore.NewJSONEncoder(fileEncoderCfg), fileSyncer, logLevel) // Use passed-in fileSyncer
 	core := zapcore.NewTee(consoleCore, fileCore)
 
 	// Build the logger instance
 	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
 
 	// Log initialization message using the newly created logger
-	logger.Info("====================================") // Added separator line from your snippet
+	logger.Info("====================================")
 	logger.Info("Base file/console logger initialized",
 		zap.String("environment", cfg.AppEnv),
-		zap.String("configuredLevel", cfg.LogLevel),
-		zap.String("effectiveLevel", logLevel.String()),
+		zap.String("configuredLevel", cfg.LogLevel),     // Log the string level from config
+		zap.String("effectiveLevel", logLevel.String()), // Log the actual level being used
 		zap.String("logFile", cfg.LogFilePath),
-		zap.String("logMaxSize", strconv.Itoa(cfg.LogMaxSize)),
-		zap.String("logRotationInterval", strconv.Itoa(cfg.LogRotateInterval)),
+		zap.Int("logMaxSizeMB", cfg.LogMaxSize), // Log MaxSize
+		// zap.String("logRotationInterval", strconv.Itoa(cfg.LogRotateInterval)), // LogRotateInterval removed, wasn't in final config
 	)
 
 	return logger, nil
@@ -175,30 +146,22 @@ func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 			logEntry.Fields = string(fieldBytes)
 		} else {
 			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal custom fields map for SQLite: %v\n", err)
-			// Encode the error itself into the fields
 			logEntry.Fields = fmt.Sprintf(`{"marshal_error": "%v", "original_message": "%s"}`, err, ent.Message)
 		}
 	}
 
 	// Insert into SQLite database
-	// Use a short timeout for the insert operation
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := c.repo.InsertSQLiteLog(ctx, logEntry)
 	if err != nil {
-		// Log critical failure to insert log to stderr to avoid infinite loops
 		fmt.Fprintf(os.Stderr, "CRITICAL: Failed to insert log entry into SQLite: %v\n", err)
-		// Avoid returning error here to prevent Zap from trying to log the error itself?
-		// Depending on Zap's internal error handling, returning error might cause issues.
-		// return fmt.Errorf("failed to insert log into sqlite via repo: %w", err)
 	}
 
-	return nil // Generally return nil from Write unless it's a critical failure Zap should know about
+	return nil // Generally return nil from Write
 }
 
 func (c *sqliteCore) Sync() error {
-	// Sync for SQLite is typically a no-op unless there's OS-level buffering concerns
-	// which are rare for typical SQLite usage.
 	return nil
 }
 
@@ -208,14 +171,11 @@ func (c *sqliteCore) clone() *sqliteCore {
 		encoder:      c.encoder.Clone(),
 		cfg:          c.cfg,
 		repo:         c.repo,
-		// Ensure deep copy of fields slice if necessary, simple append creates shallow copy
-		// but Zap manages Field immutability well enough generally.
-		fields: append([]zapcore.Field(nil), c.fields...),
+		fields:       append([]zapcore.Field(nil), c.fields...),
 	}
 }
 
 // --- Global Logger Access ---
-// Added import "path/filepath" at the top
 
 // SetGlobalLogger sets the global logger instance (use during app init).
 func SetGlobalLogger(l *zap.Logger) {
@@ -225,16 +185,13 @@ func SetGlobalLogger(l *zap.Logger) {
 }
 
 // GetLogger returns the initialized global logger.
-// Provides a fallback development logger if the global one hasn't been set.
 func GetLogger() *zap.Logger {
 	globalMu.RLock()
 	l := globalLogger
 	globalMu.RUnlock()
 
 	if l == nil {
-		// Fallback logger logs a warning if accessed before initialization
-		// Use NewProduction to avoid potential panics in Development logger if stderr is closed
-		fallbackLogger, _ := zap.NewProduction()
+		fallbackLogger, _ := zap.NewProduction() // Use Production for fallback safety
 		fallbackLogger.Warn("Global logger accessed before being set!")
 		return fallbackLogger
 	}
