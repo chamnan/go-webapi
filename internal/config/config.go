@@ -37,6 +37,8 @@ type Config struct {
 	LogProcessorOracleRetryAttempts     int // Max retries for Oracle insert on connection error
 	LogProcessorOracleRetryDelaySeconds int // Delay between retries in seconds
 	UploadDir                           string
+	SQLLiteLogEnabled                   bool   // New: To enable dedicated SQLite logging
+	SQLLiteLogLevel                     string // New: Log level for the dedicated SQLite logger
 }
 
 // LoadConfig reads configuration from environment variables or .env file
@@ -124,6 +126,9 @@ func LoadConfig(logger *zap.Logger) (*Config, error) { // logger can be nil here
 		LogProcessorOracleRetryAttempts:     getEnvAsInt("LOG_PROCESSOR_ORACLE_RETRY_ATTEMPTS", 3),
 		LogProcessorOracleRetryDelaySeconds: getEnvAsInt("LOG_PROCESSOR_ORACLE_RETRY_DELAY_SECONDS", 30),
 		// --- End Load Log Processor ---
+
+		SQLLiteLogEnabled: getEnvAsBool("SQLITE_LOG_ENABLED", true),            // Default to true, can be disabled
+		SQLLiteLogLevel:   strings.ToLower(getEnv("SQLITE_LOG_LEVEL", "warn")), // Default to 'warn' for SQLite specific logs
 	}
 	// Validation for LogLevel string here if desired
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true, "dpanic": true, "panic": true, "fatal": true}
@@ -132,6 +137,13 @@ func LoadConfig(logger *zap.Logger) (*Config, error) { // logger can be nil here
 			logger.Warn("Invalid LOG_LEVEL specified, defaulting to 'info'", zap.String("invalidLevel", cfg.LogLevel))
 		}
 		cfg.LogLevel = "info" // Reset to default if invalid
+	}
+
+	if !validLevels[cfg.SQLLiteLogLevel] {
+		if logger != nil {
+			logger.Warn("Invalid SQLITE_LOG_LEVEL specified, defaulting to 'warn'", zap.String("invalidLevel", cfg.SQLLiteLogLevel))
+		}
+		cfg.SQLLiteLogLevel = "warn" // Reset to default if invalid
 	}
 
 	batchIntervalSec := getEnvAsInt("LOG_BATCH_INTERVAL_SECONDS", 60)

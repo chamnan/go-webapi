@@ -17,11 +17,18 @@ import (
 )
 
 var (
-	globalLogger *zap.Logger
-	globalMu     sync.RWMutex // Mutex to protect globalLogger
+	globalFileLogger   *zap.Logger // Renamed from globalMainLogger
+	globalSQLiteLogger *zap.Logger // Can be nil
+	globalLoggersMu    sync.RWMutex
 )
 
-// CreateFileConsoleEncoderConfigs creates standard encoder configs for console and file.
+// AppLoggers holds the different logger instances for the application.
+type AppLoggers struct {
+	File   *zap.Logger // Renamed from Main: For general logging (console, file)
+	SQLite *zap.Logger // For dedicated SQLite logging (can be nil if disabled)
+}
+
+// CreateFileConsoleEncoderConfigs remains the same.
 func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderConfig) {
 	// Console Encoder (human-readable, colored)
 	consoleEncoderCfg := zap.NewDevelopmentEncoderConfig()
@@ -31,53 +38,64 @@ func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderCo
 
 	// File Encoder (JSON format for machine readability)
 	fileEncoderCfg := zap.NewProductionEncoderConfig()
-	fileEncoderCfg.TimeKey = "timestamp"                       // Consistent key name
-	fileEncoderCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder // Use standard format
+	fileEncoderCfg.TimeKey = "timestamp"
+	fileEncoderCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
 	fileEncoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
 
 	return consoleEncoderCfg, fileEncoderCfg
 }
 
-// InitFileConsoleLogger initializes a Zap logger with only File and Console outputs.
-// MODIFIED: Accepts the shared fileSyncer
-func InitFileConsoleLogger(cfg *config.Config, fileSyncer zapcore.WriteSyncer) (*zap.Logger, error) {
+// InitializeLoggers creates the file/console application logger
+// and a dedicated SQLite logger.
+func InitializeLoggers(cfg *config.Config, logRepo repositories.LogRepository, fileSyncer zapcore.WriteSyncer) (*AppLoggers, error) {
+	appLoggers := &AppLoggers{}
 
-	// --- Determine Log Level from Config ---
-	var logLevel zapcore.Level
-	// Use Zap's built-in unmarshaler for robustness
-	if err := logLevel.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
-		// Log warning to stderr as logger isn't fully built yet
-		fmt.Fprintf(os.Stderr, "[WARN] Invalid LOG_LEVEL '%s' for base logger, defaulting to info: %v\n", cfg.LogLevel, err)
-		logLevel = zapcore.InfoLevel // Default to Info level on error
+	// --- Initialize File/Console Logger ---
+	var fileLogLevel zapcore.Level // Renamed from mainLogLevel
+	if err := fileLogLevel.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] Invalid LOG_LEVEL '%s' for file/console logger, defaulting to info: %v\n", cfg.LogLevel, err)
+		fileLogLevel = zapcore.InfoLevel
 	}
-	// --- End Log Level Determination ---
 
-	// Use exported helpers for encoders
 	consoleEncoderCfg, fileEncoderCfg := CreateFileConsoleEncoderConfigs()
-
-	// Create Console Syncer ONLY
 	consoleSyncer := zapcore.Lock(os.Stdout)
 
-	// Create Cores using the determined logLevel and the PASSED-IN fileSyncer
-	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleSyncer, logLevel)
-	fileCore := zapcore.NewCore(zapcore.NewJSONEncoder(fileEncoderCfg), fileSyncer, logLevel) // Use passed-in fileSyncer
-	core := zapcore.NewTee(consoleCore, fileCore)
+	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleSyncer, fileLogLevel)
+	fileOutputCore := zapcore.NewCore(zapcore.NewConsoleEncoder(fileEncoderCfg), fileSyncer, fileLogLevel)
 
-	// Build the logger instance
-	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
+	fileAndConsoleLoggerCore := zapcore.NewTee(consoleCore, fileOutputCore)
+	appLoggers.File = zap.New(fileAndConsoleLoggerCore, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
 
-	// Log initialization message using the newly created logger
-	logger.Info("====================================")
-	logger.Info("Base file/console logger initialized",
+	appLoggers.File.Info("File/Console application logger initialized",
 		zap.String("environment", cfg.AppEnv),
-		zap.String("configuredLevel", cfg.LogLevel),     // Log the string level from config
-		zap.String("effectiveLevel", logLevel.String()), // Log the actual level being used
+		zap.String("configuredLevel", cfg.LogLevel),
+		zap.String("effectiveLevel", fileLogLevel.String()),
 		zap.String("logFile", cfg.LogFilePath),
-		zap.Int("logMaxSizeMB", cfg.LogMaxSize), // Log MaxSize
-		// zap.String("logRotationInterval", strconv.Itoa(cfg.LogRotateInterval)), // LogRotateInterval removed, wasn't in final config
 	)
 
-	return logger, nil
+	// --- Initialize Dedicated SQLite Logger ---
+	if cfg.SQLLiteLogEnabled {
+		var sqliteLogLevel zapcore.Level
+		if err := sqliteLogLevel.UnmarshalText([]byte(cfg.SQLLiteLogLevel)); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] Invalid SQLITE_LOG_LEVEL '%s', defaulting to warn: %v\n", cfg.SQLLiteLogLevel, err)
+			sqliteLogLevel = zapcore.WarnLevel
+		}
+		// Use the fileEncoderCfg for SQLite for consistency in JSON structure,
+		// or define a separate one if needed.
+		sqliteEncoderConfig := fileEncoderCfg // Re-using the file encoder config for JSON structure
+		sqliteJSONEncoder := zapcore.NewJSONEncoder(sqliteEncoderConfig)
+		sqliteOnlyCore := NewSQLiteCore(sqliteLogLevel, sqliteJSONEncoder, sqliteEncoderConfig, logRepo)
+
+		appLoggers.SQLite = zap.New(sqliteOnlyCore, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
+		appLoggers.File.Info("Dedicated SQLite logger initialized", // Log this info using the file/console logger
+			zap.String("effectiveLevel", sqliteLogLevel.String()),
+		)
+	} else {
+		appLoggers.File.Info("Dedicated SQLite logger is disabled by configuration.")
+		appLoggers.SQLite = zap.NewNop() // Provide a no-op logger if disabled
+	}
+
+	return appLoggers, nil
 }
 
 // --- Custom SQLite Zap Core ---
@@ -121,10 +139,8 @@ func (c *sqliteCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore
 
 // Write uses MapObjectEncoder to correctly extract and marshal custom fields.
 func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
-	// Combine core fields (from logger.With) and contextual fields (from log call site)
 	allFields := append(append([]zapcore.Field(nil), c.fields...), fields...)
 
-	// Use MapObjectEncoder to build map for custom fields
 	fieldMap := make(map[string]interface{})
 	mapEncoder := zapcore.NewMapObjectEncoder()
 	for _, field := range allFields {
@@ -133,13 +149,12 @@ func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 	fieldMap = mapEncoder.Fields
 
 	logEntry := models.LogEntry{
-		Timestamp: ent.Time.Local(), // Use Local time for DB consistency if desired
+		Timestamp: ent.Time.Local(),
 		Level:     ent.Level.String(),
 		Message:   ent.Message,
-		Fields:    "{}", // Default
+		Fields:    "{}",
 	}
 
-	// Marshal the collected custom fields map
 	if len(fieldMap) > 0 {
 		fieldBytes, err := json.Marshal(fieldMap)
 		if err == nil {
@@ -150,7 +165,6 @@ func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		}
 	}
 
-	// Insert into SQLite database
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := c.repo.InsertSQLiteLog(ctx, logEntry)
@@ -158,7 +172,7 @@ func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		fmt.Fprintf(os.Stderr, "CRITICAL: Failed to insert log entry into SQLite: %v\n", err)
 	}
 
-	return nil // Generally return nil from Write
+	return nil
 }
 
 func (c *sqliteCore) Sync() error {
@@ -175,25 +189,52 @@ func (c *sqliteCore) clone() *sqliteCore {
 	}
 }
 
-// --- Global Logger Access ---
+// --- Global Logger Access (Updated) ---
 
-// SetGlobalLogger sets the global logger instance (use during app init).
-func SetGlobalLogger(l *zap.Logger) {
-	globalMu.Lock()
-	defer globalMu.Unlock()
-	globalLogger = l
+// SetGlobalLoggers sets the global logger instances.
+func SetGlobalLoggers(fileLogger, sqliteLogger *zap.Logger) { // Renamed mainLogger to fileLogger
+	globalLoggersMu.Lock()
+	defer globalLoggersMu.Unlock()
+	globalFileLogger = fileLogger // Renamed globalMainLogger
+	if sqliteLogger != nil {
+		globalSQLiteLogger = sqliteLogger
+	} else {
+		globalSQLiteLogger = zap.NewNop() // Ensure it's not nil
+	}
 }
 
-// GetLogger returns the initialized global logger.
-func GetLogger() *zap.Logger {
-	globalMu.RLock()
-	l := globalLogger
-	globalMu.RUnlock()
+// GetFileLogger returns the initialized global file/console logger.
+func GetFileLogger() *zap.Logger { // Renamed from GetMainLogger
+	globalLoggersMu.RLock()
+	l := globalFileLogger // Renamed globalMainLogger
+	globalLoggersMu.RUnlock()
 
 	if l == nil {
-		fallbackLogger, _ := zap.NewProduction() // Use Production for fallback safety
-		fallbackLogger.Warn("Global logger accessed before being set!")
+		fallbackLogger, _ := zap.NewProduction()
+		fallbackLogger.Warn("Global file/console logger accessed before being set!")
 		return fallbackLogger
 	}
 	return l
+}
+
+// GetSQLiteLogger returns the initialized global SQLite logger.
+// Returns a Nop logger if SQLite logging was disabled or not initialized.
+func GetSQLiteLogger() *zap.Logger {
+	globalLoggersMu.RLock()
+	l := globalSQLiteLogger
+	globalLoggersMu.RUnlock()
+
+	if l == nil {
+		// This case should ideally be handled by SetGlobalLoggers ensuring it's a Nop logger.
+		return zap.NewNop()
+	}
+	return l
+}
+
+// GetLogger can be deprecated or changed to return FileLogger for backward compatibility
+// if only one logger was accessed globally previously.
+// For clarity, using GetFileLogger() or GetSQLiteLogger() is preferred.
+func GetLogger() *zap.Logger {
+	fmt.Fprintln(os.Stderr, "[WARN] logging.GetLogger() is deprecated. Use GetFileLogger() or GetSQLiteLogger(). Returning file/console logger.")
+	return GetFileLogger() // Renamed from GetMainLogger
 }
