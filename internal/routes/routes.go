@@ -78,7 +78,7 @@ func SetupRoutes(
 
 	// Protected Routes (Requires JWT Authentication)
 	// Pass the fileLogger to the JWT middleware for its operational logs
-	protected := api.Group("/", mw.Protected(cfg.JWTSecret, fileLogger))
+	protected := api.Group("/", mw.Protected(cfg.JWTSecret))
 
 	// Profile Routes (Protected)
 	components.ProfileHandler.SetupProfileRoutes(protected)
