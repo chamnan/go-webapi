@@ -17,6 +17,7 @@ import (
 
 // ErrOracleConnection is returned when an operation fails due to Oracle connection issues.
 var ErrOracleConnection = errors.New("oracle connection error")
+var ErrSQLiteConnection = errors.New("sqlite connection error") // Added for consistency
 
 // LogRepository defines the interface for log data operations
 type LogRepository interface {
@@ -27,8 +28,10 @@ type LogRepository interface {
 	// Oracle Operations
 	InsertBatchOracle(ctx context.Context, logs []models.LogEntry) error
 
-	// SetOracleDB needs to be part of the interface for the processor to call it
+	// Mutators for DB handles and logger, to be set after initial creation
 	SetOracleDB(db *sql.DB)
+	SetSqliteDB(db *sql.DB)       // New
+	SetLogger(logger *zap.Logger) // New
 }
 
 // logRepositoryImpl implements LogRepository for both SQLite and Oracle
@@ -36,18 +39,18 @@ type logRepositoryImpl struct {
 	sqliteDB *sql.DB
 	oracleDB *sql.DB // Can be nil initially or if connection fails
 	logger   *zap.Logger
-	mu       sync.RWMutex // Mutex to protect concurrent access to oracleDB
+	mu       sync.RWMutex // Mutex to protect concurrent access to DB handles and logger
 }
 
 // NewLogRepository creates a new LogRepository
 func NewLogRepository(sqliteDB *sql.DB, oracleDB *sql.DB, logger *zap.Logger) LogRepository {
 	if logger == nil {
-		fallbackLogger, _ := zap.NewDevelopment()
-		logger = fallbackLogger
+		fallbackLogger, _ := zap.NewDevelopment() // Use a simple fallback
+		logger = fallbackLogger.Named("logRepo_fallback")
 		logger.Warn("NewLogRepository received nil logger, using fallback.")
 	}
 	return &logRepositoryImpl{
-		sqliteDB: sqliteDB,
+		sqliteDB: sqliteDB, // Initial handle (can be nil)
 		oracleDB: oracleDB, // Initial handle (can be nil)
 		logger:   logger,
 	}
@@ -55,23 +58,56 @@ func NewLogRepository(sqliteDB *sql.DB, oracleDB *sql.DB, logger *zap.Logger) Lo
 
 // --- SQLite Methods ---
 func (r *logRepositoryImpl) InsertSQLiteLog(ctx context.Context, entry models.LogEntry) error {
+	r.mu.RLock()
+	currentSqliteDB := r.sqliteDB
+	currentLogger := r.logger
+	r.mu.RUnlock()
+
+	if currentSqliteDB == nil {
+		// This case should ideally be rare and only during startup if called before SetSqliteDB
+		errMsg := "CRITICAL: Attempted to insert log into SQLite via logRepo, but sqliteDB is nil."
+		if currentLogger != nil {
+			currentLogger.Error(errMsg, zap.Any("log_entry", entry))
+		} else {
+			fmt.Printf("%s Log: %+v\n", errMsg, entry) // Fallback to stdout if logger also nil
+		}
+		return fmt.Errorf("sqliteDB is not initialized in LogRepository: %w", ErrSQLiteConnection)
+	}
+
 	query := `INSERT INTO tbl_log (timestamp, level, message, fields) VALUES (?, ?, ?, ?)`
 	fieldsJSON := entry.Fields
 	if fieldsJSON == "" {
 		fieldsJSON = "{}"
 	}
-	_, err := r.sqliteDB.ExecContext(ctx, query, entry.Timestamp, entry.Level, entry.Message, fieldsJSON)
+	_, err := currentSqliteDB.ExecContext(ctx, query, entry.Timestamp, entry.Level, entry.Message, fieldsJSON)
 	if err != nil {
-		r.logger.Error("Failed to insert log into SQLite", zap.Error(err))
+		if currentLogger != nil {
+			currentLogger.Error("Failed to insert log into SQLite", zap.Error(err))
+		}
 		return fmt.Errorf("sqlite insert failed: %w", err)
 	}
 	return nil
 }
+
 func (r *logRepositoryImpl) GetSQLiteLogs(ctx context.Context, limit int) ([]models.LogEntry, error) {
+	r.mu.RLock()
+	currentSqliteDB := r.sqliteDB
+	currentLogger := r.logger
+	r.mu.RUnlock()
+
+	if currentSqliteDB == nil {
+		if currentLogger != nil {
+			currentLogger.Error("Attempted to get logs from SQLite, but sqliteDB is nil.")
+		}
+		return nil, fmt.Errorf("sqliteDB is not initialized in LogRepository: %w", ErrSQLiteConnection)
+	}
+
 	query := `SELECT id, timestamp, level, message, fields FROM tbl_log ORDER BY id ASC LIMIT ?`
-	rows, err := r.sqliteDB.QueryContext(ctx, query, limit)
+	rows, err := currentSqliteDB.QueryContext(ctx, query, limit)
 	if err != nil {
-		r.logger.Error("Failed to query logs from SQLite", zap.Error(err))
+		if currentLogger != nil {
+			currentLogger.Error("Failed to query logs from SQLite", zap.Error(err))
+		}
 		return nil, fmt.Errorf("sqlite query failed: %w", err)
 	}
 	defer rows.Close()
@@ -80,15 +116,34 @@ func (r *logRepositoryImpl) GetSQLiteLogs(ctx context.Context, limit int) ([]mod
 		var entry models.LogEntry
 		var tsStr string
 		var fields sql.NullString
-		if err := rows.Scan(&entry.ID, &tsStr, &entry.Level, &entry.Message, &fields); err != nil {
-			r.logger.Error("Failed to scan log row from SQLite", zap.Error(err))
-			continue
+		if errScan := rows.Scan(&entry.ID, &tsStr, &entry.Level, &entry.Message, &fields); errScan != nil {
+			if currentLogger != nil {
+				currentLogger.Error("Failed to scan log row from SQLite", zap.Error(errScan))
+			}
+			continue // Or return error, depending on desired strictness
 		}
-		entry.Timestamp, err = time.Parse(time.RFC3339Nano, tsStr)
-		if err != nil {
-			r.logger.Warn("Failed to parse timestamp from SQLite", zap.String("raw_ts", tsStr), zap.Error(err))
-			entry.Timestamp = time.Now().UTC()
+		// Attempt to parse timestamp in RFC3339Nano format (common for Zap)
+		// If parsing fails, try other common formats or default to current time.
+		parsedTime, parseErr := time.Parse(time.RFC3339Nano, tsStr)
+		if parseErr != nil {
+			// Fallback to SQLite's typical DATETIME format if RFC3339Nano fails
+			parsedTime, parseErr = time.Parse("2006-01-02 15:04:05.999999999-07:00", tsStr) // common full format
+			if parseErr != nil {
+				parsedTime, parseErr = time.Parse("2006-01-02 15:04:05", tsStr) // common short format
+			}
 		}
+
+		if parseErr != nil {
+			if currentLogger != nil {
+				currentLogger.Warn("Failed to parse timestamp from SQLite, using current UTC time.",
+					zap.String("raw_timestamp", tsStr),
+					zap.Error(parseErr))
+			}
+			entry.Timestamp = time.Now().UTC() // Fallback to current time
+		} else {
+			entry.Timestamp = parsedTime.Local() // Convert to local if appropriate, or keep as UTC
+		}
+
 		if fields.Valid {
 			entry.Fields = fields.String
 		} else {
@@ -96,13 +151,26 @@ func (r *logRepositoryImpl) GetSQLiteLogs(ctx context.Context, limit int) ([]mod
 		}
 		logs = append(logs, entry)
 	}
-	if err = rows.Err(); err != nil {
-		r.logger.Error("Error during iteration over SQLite log rows", zap.Error(err))
-		return nil, fmt.Errorf("sqlite row iteration error: %w", err)
+	if errRows := rows.Err(); errRows != nil {
+		if currentLogger != nil {
+			currentLogger.Error("Error during iteration over SQLite log rows", zap.Error(errRows))
+		}
+		return nil, fmt.Errorf("sqlite row iteration error: %w", errRows)
 	}
 	return logs, nil
 }
 func (r *logRepositoryImpl) DeleteSQLiteLogsByID(ctx context.Context, ids []int64) error {
+	r.mu.RLock()
+	currentSqliteDB := r.sqliteDB
+	currentLogger := r.logger
+	r.mu.RUnlock()
+
+	if currentSqliteDB == nil {
+		if currentLogger != nil {
+			currentLogger.Error("Attempted to delete logs from SQLite, but sqliteDB is nil.")
+		}
+		return fmt.Errorf("sqliteDB is not initialized in LogRepository: %w", ErrSQLiteConnection)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
@@ -113,13 +181,17 @@ func (r *logRepositoryImpl) DeleteSQLiteLogsByID(ctx context.Context, ids []int6
 		args[i] = id
 	}
 	query := fmt.Sprintf(`DELETE FROM tbl_log WHERE id IN (%s)`, strings.Join(placeholders, ","))
-	result, err := r.sqliteDB.ExecContext(ctx, query, args...)
+	result, err := currentSqliteDB.ExecContext(ctx, query, args...)
 	if err != nil {
-		r.logger.Error("Failed to delete logs from SQLite", zap.Error(err))
+		if currentLogger != nil {
+			currentLogger.Error("Failed to delete logs from SQLite", zap.Error(err))
+		}
 		return fmt.Errorf("sqlite delete failed: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
-	r.logger.Debug("Deleted logs from SQLite", zap.Int64("rows_affected", rowsAffected), zap.Int("id_count", len(ids)))
+	if currentLogger != nil {
+		currentLogger.Debug("Deleted logs from SQLite", zap.Int64("rows_affected", rowsAffected), zap.Int("id_count", len(ids)))
+	}
 	return nil
 }
 
@@ -129,43 +201,52 @@ func (r *logRepositoryImpl) DeleteSQLiteLogsByID(ctx context.Context, ids []int6
 
 // InsertBatchOracle inserts a slice of LogEntry into Oracle tbl_log using a batch operation
 func (r *logRepositoryImpl) InsertBatchOracle(ctx context.Context, logs []models.LogEntry) error {
+	r.mu.RLock()
+	currentOracleDB := r.oracleDB
+	currentLogger := r.logger
+	r.mu.RUnlock()
+
 	if len(logs) == 0 {
 		return nil
 	}
 
-	// Use RLock for reading the handle safely
-	r.mu.RLock()
-	currentOracleDB := r.oracleDB
-	r.mu.RUnlock()
-
 	if currentOracleDB == nil {
-		r.logger.Warn("Skipping Oracle insert: Oracle DB handle is currently nil in repository")
+		if currentLogger != nil {
+			currentLogger.Warn("Skipping Oracle insert: Oracle DB handle is currently nil in repository")
+		}
 		return fmt.Errorf("repository oracle DB handle is nil: %w", ErrOracleConnection)
 	}
 
-	// Ping before transaction
 	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
-	err := currentOracleDB.PingContext(pingCtx) // Use the read handle
+	err := currentOracleDB.PingContext(pingCtx)
 	cancelPing()
 	if err != nil {
-		r.logger.Warn("Oracle ping failed before batch insert", zap.Error(err))
-		return fmt.Errorf("oracle ping failed: %w", ErrOracleConnection)
+		if currentLogger != nil {
+			currentLogger.Warn("Oracle ping failed before batch insert", zap.Error(err))
+		}
+		return fmt.Errorf("oracle ping failed: %w: %w", err, ErrOracleConnection)
 	}
 
-	tx, err := currentOracleDB.BeginTx(ctx, nil) // Use the read handle
+	tx, err := currentOracleDB.BeginTx(ctx, nil)
 	if err != nil {
-		r.logger.Error("Failed to begin Oracle transaction", zap.Error(err))
-		if isConnectionError(err) {
+		if currentLogger != nil {
+			currentLogger.Error("Failed to begin Oracle transaction", zap.Error(err))
+		}
+		if isConnectionError(err) { // isConnectionError needs to be defined or imported
 			return fmt.Errorf("oracle begin tx failed: %w: %w", err, ErrOracleConnection)
 		}
 		return fmt.Errorf("oracle begin tx failed: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() // Ensure rollback on error
 
+	// Ensure your Oracle tbl_log has columns like: LOG_TIMESTAMP, LOG_LEVEL, LOG_MESSAGE, LOG_DETAILS
+	// LOG_TIMESTAMP should be TIMESTAMP, LOG_LEVEL VARCHAR2, LOG_MESSAGE CLOB/VARCHAR2, LOG_DETAILS CLOB (for JSON string)
 	query := `INSERT INTO tbl_log (log_timestamp, log_level, log_message, log_details) VALUES (:1, :2, :3, :4)`
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		r.logger.Error("Failed to prepare Oracle batch insert statement", zap.Error(err))
+		if currentLogger != nil {
+			currentLogger.Error("Failed to prepare Oracle batch insert statement", zap.Error(err))
+		}
 		if isConnectionError(err) {
 			return fmt.Errorf("oracle prepare failed: %w: %w", err, ErrOracleConnection)
 		}
@@ -178,20 +259,30 @@ func (r *logRepositoryImpl) InsertBatchOracle(ctx context.Context, logs []models
 	for _, entry := range logs {
 		fieldsData := entry.Fields
 		if fieldsData == "" {
-			fieldsData = "{}"
+			fieldsData = "{}" // Ensure valid JSON, even if empty
 		}
-		_, err := stmt.ExecContext(ctx, entry.Timestamp, entry.Level, entry.Message, fieldsData)
-		if err != nil {
-			if firstExecError == nil {
-				firstExecError = err
-				firstExecErrorIsConn = isConnectionError(err)
-				r.logger.Error("First error during Oracle batch insert execution", zap.Error(err), zap.Int64("sqlite_id", entry.ID))
+		// Oracle might require specific timestamp format or conversion if not directly compatible.
+		// entry.Timestamp is time.Time, godror should handle it.
+		_, execErr := stmt.ExecContext(ctx, entry.Timestamp, entry.Level, entry.Message, fieldsData)
+		if execErr != nil {
+			if firstExecError == nil { // Store only the first error for reporting
+				firstExecError = execErr
+				firstExecErrorIsConn = isConnectionError(execErr)
+				if currentLogger != nil {
+					currentLogger.Error("Error during Oracle batch insert execution (first error in batch)",
+						zap.Error(execErr),
+						zap.Int64("sqlite_log_id", entry.ID), // Assuming LogEntry has an ID from SQLite
+					)
+				}
 			}
-			break // Stop batch on first error
+			// Depending on requirements, you might break or continue.
+			// Breaking on first error is often safer for batch operations.
+			break
 		}
 	}
 
 	if firstExecError != nil {
+		// Rollback is handled by defer.
 		baseErr := fmt.Errorf("oracle batch exec failed (first error: %w)", firstExecError)
 		if firstExecErrorIsConn {
 			return fmt.Errorf("%w: %w", baseErr, ErrOracleConnection)
@@ -199,61 +290,91 @@ func (r *logRepositoryImpl) InsertBatchOracle(ctx context.Context, logs []models
 		return baseErr
 	}
 
-	if err := tx.Commit(); err != nil {
-		r.logger.Error("Failed to commit Oracle transaction", zap.Error(err))
-		if isConnectionError(err) {
-			return fmt.Errorf("oracle commit failed: %w: %w", err, ErrOracleConnection)
+	if errCommit := tx.Commit(); errCommit != nil {
+		if currentLogger != nil {
+			currentLogger.Error("Failed to commit Oracle transaction", zap.Error(errCommit))
 		}
-		return fmt.Errorf("oracle commit failed: %w", err)
+		if isConnectionError(errCommit) {
+			return fmt.Errorf("oracle commit failed: %w: %w", errCommit, ErrOracleConnection)
+		}
+		return fmt.Errorf("oracle commit failed: %w", errCommit)
 	}
 
-	r.logger.Debug("Successfully inserted log batch into Oracle", zap.Int("batch_size", len(logs)))
+	if currentLogger != nil {
+		currentLogger.Debug("Successfully inserted log batch into Oracle", zap.Int("batch_size", len(logs)))
+	}
 	return nil
 }
 
-// SetOracleDB allows updating the Oracle DB handle after initialization (e.g., by processor).
-// It is concurrency-safe using a RWMutex.
+// SetOracleDB allows updating the Oracle DB handle after initialization.
 func (r *logRepositoryImpl) SetOracleDB(db *sql.DB) {
-	r.mu.Lock() // Use full lock for writing the handle
+	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	// Decide if you want to close the old one. This is risky if the handle is shared
-	// and another goroutine might still be using the old one.
-	// For simplicity, we'll just replace it here. The old pool might get garbage collected
-	// or closed eventually if the handle passed from InitOracle is closed in app.go.
-	// if r.oracleDB != nil {
-	//  r.logger.Warn("Replacing existing Oracle DB handle in repository.")
-	//  // r.oracleDB.Close() // Consider implications carefully
-	// }
-
-	r.oracleDB = db // Update the handle
-	status := "nil"
-	if db != nil {
-		status = "set/updated"
+	// Optionally close the old r.oracleDB if it's being replaced and managed by logRepo exclusively
+	// if r.oracleDB != nil { r.oracleDB.Close() }
+	r.oracleDB = db
+	if r.logger != nil {
+		status := "nil"
+		if db != nil {
+			status = "set/updated"
+		}
+		r.logger.Info("LogRepository Oracle DB handle updated via SetOracleDB.", zap.String("status", status))
 	}
-	r.logger.Info("LogRepository Oracle DB handle updated via SetOracleDB", zap.String("status", status))
 }
 
-// isConnectionError helper function (keep as before or enhance)
+// SetSqliteDB allows updating the SQLite DB handle.
+func (r *logRepositoryImpl) SetSqliteDB(db *sql.DB) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Optionally close the old r.sqliteDB if it's being replaced
+	// if r.sqliteDB != nil { r.sqliteDB.Close() }
+	r.sqliteDB = db
+	if r.logger != nil {
+		status := "nil"
+		if db != nil {
+			status = "set/updated"
+		}
+		r.logger.Info("LogRepository SQLite DB handle updated via SetSqliteDB.", zap.String("status", status))
+	}
+}
+
+// SetLogger allows updating the logger instance used by the repository.
+func (r *logRepositoryImpl) SetLogger(logger *zap.Logger) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.logger = logger
+	if r.logger != nil { // Log this with the new logger if possible
+		r.logger.Info("LogRepository internal logger has been updated.")
+	} else { // Fallback if new logger is nil
+		fmt.Println("[INFO] LogRepository internal logger has been set (possibly to nil).")
+	}
+}
+
+// isConnectionError helper function (copied from your existing code or simplified)
+// You should have a robust way to identify connection errors.
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Basic checks, expand as needed based on godror errors
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	if errors.Is(err, ErrOracleConnection) {
-		return true
-	}
+	// Add Oracle specific error codes or string checks if available from godror
+	// e.g., ORA-03113: end-of-file on communication channel
+	// e.g., ORA-12541: TNS:no listener
+	// e.g., ORA-12170: TNS:Connect timeout occurred
 	errStr := strings.ToLower(err.Error())
-	// Add more specific error string checks based on your driver/environment
-	if strings.Contains(errStr, "ora-03113") || strings.Contains(errStr, "ora-03114") || strings.Contains(errStr, "ora-125") ||
-		strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "network error") || strings.Contains(errStr, "i/o error") ||
-		strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "reset by peer") || strings.Contains(errStr, "timeout") {
+	if strings.Contains(errStr, "ora-03113") ||
+		strings.Contains(errStr, "ora-03114") ||
+		strings.Contains(errStr, "ora-12170") ||
+		strings.Contains(errStr, "ora-12541") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "network error") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "i/o error") ||
+		strings.Contains(errStr, "timeout") {
 		return true
 	}
 	return false
 }
-
-// REMOVED SetLogger implementation (logger set only via NewLogRepository)
-// REMOVED IsOracleConnected implementation

@@ -36,8 +36,9 @@ func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderCo
 	consoleEncoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	consoleEncoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
 
-	// File Encoder (JSON format for machine readability)
+	// File Encoder
 	fileEncoderCfg := zap.NewProductionEncoderConfig()
+	fileEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
 	fileEncoderCfg.TimeKey = "timestamp"
 	fileEncoderCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
 	fileEncoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
@@ -65,7 +66,7 @@ func InitializeLoggers(cfg *config.Config, logRepo repositories.LogRepository, f
 
 	fileAndConsoleLoggerCore := zapcore.NewTee(consoleCore, fileOutputCore)
 	appLoggers.File = zap.New(fileAndConsoleLoggerCore, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
-
+	appLoggers.File.Info("======================================================================================")
 	appLoggers.File.Info("File/Console application logger initialized",
 		zap.String("environment", cfg.AppEnv),
 		zap.String("configuredLevel", cfg.LogLevel),

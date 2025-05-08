@@ -14,7 +14,10 @@ import (
 // Config holds all configuration for the application
 type Config struct {
 	AppEnv                              string
+	AppName                             string
 	Port                                string
+	Prefork                             bool
+	ProcNum                             int
 	CORSAllowOrigins                    string
 	CORSAllowMethods                    string
 	CORSAllowHeaders                    string
@@ -90,7 +93,9 @@ func LoadConfig(logger *zap.Logger) (*Config, error) { // logger can be nil here
 
 	cfg := &Config{
 		AppEnv:    getEnv("APP_ENV", "local"),
+		AppName:   getEnv("APP_NAME", "my-go-webapi"),
 		Port:      getEnv("PORT", "3000"),
+		Prefork:   getEnvAsBool("PREFORK", false),
 		JWTSecret: getEnv("JWT_SECRET", "default-secret"),
 		// --- Load Oracle Settings ---
 		OracleConnString:                 getEnv("ORACLE_CONN_STRING", ""),

@@ -6,12 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"go-webapi/internal/repositories"
-	// "net" // No longer needed for banner
+	"go-webapi/internal/utils"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	// "runtime" // No longer needed for banner
 	"strings"
 	"syscall"
 	"time"
@@ -20,7 +19,7 @@ import (
 	"go-webapi/internal/config"
 	"go-webapi/internal/database"
 	"go-webapi/internal/logging"
-	"go-webapi/internal/middleware" // Ensure middleware package is imported
+	"go-webapi/internal/middleware"
 	routes "go-webapi/internal/routes"
 
 	"github.com/DeRuina/timberjack"
@@ -40,13 +39,15 @@ func Run() {
 	var sqliteDB *sql.DB
 	var cfg *config.Config
 	var err error
-	var app *fiber.App // Declare app variable earlier
+	var appFiber *fiber.App // Renamed to avoid conflict with package name 'app'
 	var components *bootstrap.AppComponents
 	var fileSyncer zapcore.WriteSyncer
 	var logRepo repositories.LogRepository
 
 	// --- 1. Load Configuration ---
 	tempConfigLogger, _ := zap.NewProduction(zap.ErrorOutput(zapcore.Lock(os.Stderr)))
+	defer tempConfigLogger.Sync()
+
 	cfg, err = config.LoadConfig(tempConfigLogger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to load configuration: %v\n", err)
@@ -71,27 +72,16 @@ func Run() {
 		RotationInterval: time.Duration(cfg.LogRotateInterval) * time.Hour,
 	}
 	fileSyncer = zapcore.AddSync(timberJackLogger)
-	fmt.Fprintf(os.Stderr, "[INFO] Shared file syncer created for path: %s with MaxSize: %d MB\n", cfg.LogFilePath, cfg.LogMaxSize)
+	fmt.Fprintf(os.Stderr, "[INFO] Shared file syncer created for path: %s with MaxSize: %d MB, RotateInterval: %d hours\n", cfg.LogFilePath, cfg.LogMaxSize, cfg.LogRotateInterval)
 
-	// --- 3. Initialize Databases ---
-	sqliteDB, err = database.InitSQLite(cfg, tempConfigLogger)
-	if err != nil {
-		tempConfigLogger.Fatal("Failed to initialize SQLite database", zap.Error(err))
-	}
-	tempConfigLogger.Info("SQLite database initialized successfully (using temp logger).")
+	// --- 3. Initialize LogRepository (with nil DBs and temp logger initially) ---
+	// LogRepository methods (InsertSQLiteLog) must be nil-safe for DB handles during this early phase.
+	logRepo = repositories.NewLogRepository(nil, nil, tempConfigLogger)
+	tempConfigLogger.Info("LogRepository initially created (DB handles are nil, using temp logger).")
 
-	oracleDB, err = database.InitOracle(cfg, tempConfigLogger)
-	if err != nil {
-		tempConfigLogger.Error("Error during Oracle DB pool initialization (continuing)", zap.Error(err))
-	} else if oracleDB != nil {
-		tempConfigLogger.Info("Oracle database pool initialized (using temp logger).")
-	}
-
-	// --- 4. Initialize LogRepository ---
-	logRepo = repositories.NewLogRepository(sqliteDB, oracleDB, tempConfigLogger)
-	tempConfigLogger.Info("LogRepository initialized (using temp logger).")
-
-	// --- 5. Initialize Loggers ---
+	// --- 4. Initialize Main Application Loggers (File/Console and SQLite-dedicated) ---
+	// InitializeLoggers uses logRepo. If sqliteLogger writes via logRepo here,
+	// InsertSQLiteLog in logRepo will see sqliteDB as nil and should handle it gracefully (e.g., log error to stderr).
 	appLoggers, err := logging.InitializeLoggers(cfg, logRepo, fileSyncer)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Failed to initialize application loggers: %v\n", err)
@@ -99,55 +89,90 @@ func Run() {
 	}
 	fileLogger = appLoggers.File
 	sqliteLogger = appLoggers.SQLite
+
+	// --- 5. Set Global Loggers ---
 	logging.SetGlobalLoggers(fileLogger, sqliteLogger)
+	fileLogger.Info("Global application loggers (file/console and SQLite-dedicated) have been set.")
+	// Update the logger instance within logRepo to use the final fileLogger
+	if lrWithSetter, ok := logRepo.(interface{ SetLogger(*zap.Logger) }); ok {
+		lrWithSetter.SetLogger(fileLogger) // logRepo will now use final fileLogger for its own messages
+		fileLogger.Info("Final fileLogger set for LogRepository's internal logging.")
+	}
 
-	// --- 6. Log Loaded Config Details ---
-	logLoadedConfigDetails(fileLogger, cfg)
+	// --- 6. Trace Config Details (using the final fileLogger) ---
+	utils.TraceConfigDetails(fileLogger, cfg)
 
-	// --- 7. Initialize Fiber App ---
+	// --- 7. Initialize SQLite Database (using final fileLogger) ---
+	// This is now after fileLogger is ready.
+	sqliteDB, err = database.InitSQLite(cfg, fileLogger)
+	if err != nil {
+		fileLogger.Fatal("Failed to initialize SQLite database", zap.Error(err))
+	}
+	fileLogger.Info("SQLite database initialized successfully (using final fileLogger).")
+
+	// Update LogRepository with the initialized SQLiteDB
+	if lrWithSetter, ok := logRepo.(interface{ SetSqliteDB(*sql.DB) }); ok {
+		lrWithSetter.SetSqliteDB(sqliteDB)
+		fileLogger.Info("SQLiteDB handle has been set in LogRepository. sqliteLogger should now function fully.")
+	} else {
+		fileLogger.Error("LogRepository does not implement SetSqliteDB. sqliteLogger might not work.")
+	}
+
+	// --- 8. Initialize Oracle Database (using final fileLogger) ---
+	// This was already after fileLogger in the previous step.
+	oracleDB, err = database.InitOracle(cfg, fileLogger)
+	if err != nil {
+		fileLogger.Error("Error during Oracle DB pool initialization. Operations requiring Oracle may fail.", zap.Error(err))
+	} else if oracleDB != nil {
+		fileLogger.Info("Oracle database pool initialized successfully (using final fileLogger).")
+		// Update LogRepository with the initialized OracleDB
+		if lrWithSetter, ok := logRepo.(interface{ SetOracleDB(*sql.DB) }); ok {
+			lrWithSetter.SetOracleDB(oracleDB)
+			fileLogger.Info("OracleDB handle has been set in LogRepository.")
+		} else {
+			fileLogger.Error("LogRepository does not implement SetOracleDB. Oracle part of logRepo might not work.")
+		}
+	}
+
+	// --- 9. Initialize Fiber App ---
 	fileLogger.Info("Initializing Fiber application...")
-	app = fiber.New(fiber.Config{
-		Prefork:               os.Getenv("APP_ENV") == "production", // Set Prefork based on Env
-		DisableStartupMessage: false,                                // Disable default banner
+	appFiber = fiber.New(fiber.Config{
+		AppName: cfg.AppName,
+		Prefork: cfg.Prefork,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
-			// Use request-scoped logger - THIS IS THE FIX
 			lg := middleware.GetRequestFileLogger(c)
 			code := fiber.StatusInternalServerError
 			var e *fiber.Error
-			// Add nil check for 'e' after errors.As - THIS IS THE PANIC FIX
 			if errors.As(err, &e) && e != nil {
 				code = e.Code
 			} else if err != nil {
-				// Log non-fiber errors that might reach here
 				lg.Error("Non-fiber error in ErrorHandler", zap.Error(err))
 			} else {
-				// Log if error handler was called with nil error (shouldn't happen)
 				lg.Error("ErrorHandler called with nil error")
 			}
 
-			// Ensure 'c' is not nil before accessing methods (extra safety)
 			if c == nil {
 				fmt.Println("FATAL: fiber.Ctx is nil in ErrorHandler")
-				// Cannot return JSON if context is nil
-				return errors.New("internal context error") // Or handle differently
+				return errors.New("internal context error")
 			}
-
-			// Proceed with logging and response
-			fields := []zap.Field{zap.Int("status", code), zap.Error(err)}
-			// Safely add request details
-			fields = append(fields, zap.String("path", c.Path()))
-			fields = append(fields, zap.String("method", c.Method()))
-			fields = append(fields, zap.String("ip", c.IP()))
-
+			fields := []zap.Field{
+				zap.Int("status", code),
+				zap.String("path", c.Path()),
+				zap.String("method", c.Method()),
+				zap.String("ip", c.IP()),
+				zap.Error(err),
+			}
+			if reqIDStr, ok := c.Locals(middleware.RequestIDKey).(string); ok && reqIDStr != "" {
+				fields = append(fields, zap.String("request_id", reqIDStr))
+			}
 			if code == fiber.StatusNotFound {
 				lg.Warn("Resource not found", fields...)
 			} else {
-				lg.Error("Unhandled error", fields...)
+				lg.Error("Unhandled error caught by global ErrorHandler", fields...)
 			}
 			resp := fiber.Map{"error": "An unexpected error occurred"}
-			// Ensure cfg is not nil before accessing (extra safety)
 			if cfg != nil && cfg.AppEnv != "production" {
-				if err != nil { // Ensure err is not nil before calling Error()
+				if err != nil {
 					resp["detail"] = err.Error()
 				} else {
 					resp["detail"] = "Error object was nil"
@@ -157,95 +182,91 @@ func Run() {
 		},
 	})
 
-	// --- 8. Initialize Remaining Components ---
+	// --- 10. Initialize Remaining Application Components (Bootstrap) ---
 	components, err = bootstrap.InitializeAppComponents(cfg, fileLogger, sqliteLogger, sqliteDB, oracleDB, logRepo)
 	if err != nil {
 		fileLogger.Fatal("Failed to initialize application components", zap.Error(err))
 	}
-	logProcessor := components.LogProcessor
+	// logProcessor instance is obtained from components. Ensure bootstrap wires it up correctly.
+	// var logProcessor *logging.LogProcessor // local var if needed, or use components.LogProcessor directly
 
-	// --- 9. Register Middleware ---
-	// ORDER MATTERS!
-	// 9.1. Recovery (to catch panics early)
-	app.Use(recover.New(recover.Config{EnableStackTrace: cfg.AppEnv != "production", StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
-		logger := middleware.GetRequestFileLogger(c)
-		logger.Error("Panic recovered", zap.Any("panic_value", e), zap.Stack("stacktrace"))
-	}}))
-
-	// 9.2. CORS
+	// --- 11. Register Middleware ---
+	appFiber.Use(recover.New(recover.Config{
+		EnableStackTrace: cfg.AppEnv != "production",
+		StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
+			logger := middleware.GetRequestFileLogger(c)
+			if logger == nil {
+				logger = logging.GetFileLogger()
+			}
+			logger.Error("Panic recovered", zap.Any("panic_value", e), zap.Stack("stacktrace"))
+		},
+	}))
 	fileLogger.Info("Configuring CORS", zap.String("origins", cfg.CORSAllowOrigins), zap.String("methods", cfg.CORSAllowMethods), zap.String("headers", cfg.CORSAllowHeaders))
-	app.Use(cors.New(cors.Config{
+	appFiber.Use(cors.New(cors.Config{
 		AllowOrigins: cfg.CORSAllowOrigins,
 		AllowMethods: cfg.CORSAllowMethods,
 		AllowHeaders: cfg.CORSAllowHeaders,
 	}))
-
-	// 9.3. RequestLoggers (to inject scoped loggers for subsequent middleware/handlers)
-	app.Use(middleware.RequestLoggers(fileLogger, sqliteLogger))
-
-	// 9.4. RequestDebugLogger (uses the scoped logger injected above)
-	app.Use(middleware.RequestDebugLogger())
-
-	// 9.5. FiberZap (access logging - uses base fileLogger, but runs after request loggers are set)
-	app.Use(fiberzap.New(fiberzap.Config{
-		Logger: fileLogger,                                                    // Use the base logger for output destination
+	appFiber.Use(middleware.RequestLoggers(fileLogger, sqliteLogger))
+	if strings.ToLower(cfg.LogLevel) == "debug" {
+		appFiber.Use(middleware.RequestDebugLogger())
+	}
+	appFiber.Use(fiberzap.New(fiberzap.Config{
+		Logger: fileLogger,
 		Fields: []string{"status", "method", "url", "ip", "latency", "error"}, // Keep desired standard fields
-		// Use FieldsFunc to add dynamic fields per request
 		FieldsFunc: func(c *fiber.Ctx) []zap.Field {
-			fields := []zap.Field{
-				zap.String("log_type", "access"), // Add a static field here if desired
-			}
-			// --- MODIFIED: Prioritize getting request_id from Locals ---
+			fields := []zap.Field{zap.String("log_type", "access")}
 			reqID := ""
 			if idVal := c.Locals(middleware.RequestIDKey); idVal != nil {
 				if idStr, ok := idVal.(string); ok {
 					reqID = idStr
 				}
 			}
-			// Fallback to header if not found in locals (optional, locals should work)
 			if reqID == "" {
 				reqID = c.Get(middleware.RequestIDHeader)
 			}
-			// --- End Modification ---
-
 			if reqID != "" {
 				fields = append(fields, zap.String("request_id", reqID))
 			}
-			// Add any other dynamic fields needed from fiber.Ctx 'c' here
 			return fields
 		},
 		Next: func(c *fiber.Ctx) bool {
-			// Skip logging for health checks or static assets if desired
 			return c.Path() == "/health" || strings.HasPrefix(c.Path(), "/uploads")
 		},
 	}))
 
-	// --- 10. Setup Routes ---
-	// Routes are registered after all general middleware
-	routes.SetupRoutes(app, cfg, fileLogger, components, sqliteDB, oracleDB)
+	// --- 12. Setup Application Routes ---
+	routes.SetupRoutes(appFiber, cfg, fileLogger, components, sqliteDB, oracleDB)
 
-	// --- 11. Log Custom Startup Banner --- **REMOVED**
-	// logCustomStartupBanner(fileLogger, app, cfg.Port) // REMOVED CALL
-
-	// --- 12. Start Log Processor ---
-	if logProcessor != nil {
-		logProcessor.Start()
+	// --- 13. Start Log Processor (conditionally if not a forked child) ---
+	if components != nil && components.LogProcessor != nil {
+		// When Prefork is true, appFiber.IsChild() will be true in child processes.
+		// We only want the LogProcessor to run in the master process.
+		if !fiber.IsChild() {
+			fileLogger.Info("Master process starting LogProcessor...", zap.Int("pid", os.Getpid()))
+			components.LogProcessor.Start()
+		} else {
+			fileLogger.Info("Child process will not start its own LogProcessor instance.", zap.Int("pid", os.Getpid()))
+		}
+	} else {
+		fileLogger.Warn("LogProcessor is nil or components are nil, cannot start it.")
 	}
 
-	// --- 13. Start Server & Graceful Shutdown ---
+	// --- 14. Start Server & Graceful Shutdown ---
 	serverCtx, cancelServerCtx := context.WithCancel(context.Background())
 	defer cancelServerCtx()
 	serverStopped := make(chan struct{})
+
 	go func() {
 		defer close(serverStopped)
 		listenAddr := ":" + cfg.Port
-		// Log server start message here instead of banner
-		fileLogger.Info("Starting server",
+		fileLogger.Info("Starting Fiber server...",
 			zap.String("address", listenAddr),
-			zap.Bool("prefork", app.Config().Prefork), // Access prefork setting from app config
+			zap.Bool("prefork_enabled", appFiber.Config().Prefork), // Access from appFiber.Config()
 			zap.Int("pid", os.Getpid()),
+			zap.String("app_env", cfg.AppEnv),
 		)
-		if err := app.Listen(listenAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := appFiber.Listen(listenAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fileLogger.Error("Server listener failed", zap.String("address", listenAddr), zap.Error(err))
 			cancelServerCtx()
 		}
@@ -261,105 +282,52 @@ func Run() {
 	}
 
 	fileLogger.Info("Initiating graceful shutdown...")
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 60*time.Second) // Try 60 seconds, adjust as needed
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelShutdown()
 
-	if logProcessor != nil {
-		logProcessor.Stop()
+	// Stop the LogProcessor (only if master process and processor exists)
+	if components != nil && components.LogProcessor != nil && !fiber.IsChild() {
+		fileLogger.Info("Master process stopping LogProcessor...", zap.Int("pid", os.Getpid()))
+		components.LogProcessor.Stop()
 	}
 
-	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+	if err := appFiber.ShutdownWithContext(shutdownCtx); err != nil {
 		fileLogger.Error("Fiber server shutdown failed", zap.Error(err))
 	} else {
 		fileLogger.Info("Fiber server gracefully stopped.")
 	}
 	<-serverStopped
-	fileLogger.Info("HTTP listener stopped.")
+	fileLogger.Info("HTTP listener goroutine stopped.")
 
 	fileLogger.Info("Syncing file/console logger before shutdown...")
-	_ = fileLogger.Sync()
-	if sqliteLogger != nil && sqliteLogger != fileLogger {
-		fileLogger.Info("Syncing SQLite logger before shutdown...")
-		_ = sqliteLogger.Sync()
+	if errSync := fileLogger.Sync(); errSync != nil {
+		errMsg := errSync.Error()
+		if strings.Contains(errMsg, "handle is invalid") || strings.Contains(errMsg, "sync /dev/stdout") {
+			// Log as debug or info, as this is often expected when stdout isn't available at exit
+			fileLogger.Debug("Logger sync warning for stdout (handle likely invalid during shutdown).", zap.Error(errSync))
+		} else {
+			// Log other sync errors as warnings or errors
+			fileLogger.Warn("Error syncing file/console logger.", zap.Error(errSync))
+			// Use fmt.Fprintf as a fallback if the logger itself might be failing
+			fmt.Fprintf(os.Stderr, "[WARN] Error syncing file/console logger: %v\n", errSync)
+		}
 	}
-	fmt.Println("[INFO] Logger sync attempt completed.")
+	fmt.Println("[INFO] Logger sync attempts completed.")
 
 	if sqliteDB != nil {
-		if err := sqliteDB.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] Error closing SQLite database: %v\n", err)
+		if errClose := sqliteDB.Close(); errClose != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Error closing SQLite database: %v\n", errClose)
 		} else {
 			fmt.Println("[INFO] SQLite database connection closed.")
 		}
 	}
 	if oracleDB != nil {
-		if err := oracleDB.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] Error closing Oracle database pool: %v\n", err)
+		if errClose := oracleDB.Close(); errClose != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Error closing Oracle database pool: %v\n", errClose)
 		} else {
 			fmt.Println("[INFO] Oracle database pool closed.")
 		}
 	}
 
 	fmt.Println("[INFO] Application shutdown complete.")
-}
-
-// logLoadedConfigDetails function remains the same
-func logLoadedConfigDetails(logger *zap.Logger, cfg *config.Config) {
-	if logger == nil || cfg == nil {
-		return
-	}
-	maskedOracleConn := maskOracleConnString(cfg.OracleConnString)
-	maskedJWTSecret := "*** MASKED ***"
-	if cfg.JWTSecret == "default-secret" {
-		maskedJWTSecret = "default-secret (!!!)"
-	} else if len(cfg.JWTSecret) == 0 {
-		maskedJWTSecret = "--- EMPTY ---"
-	}
-	fields := []zapcore.Field{
-		zap.String("AppEnv", cfg.AppEnv),
-		zap.String("Port", cfg.Port),
-		zap.String("JWTSecret", maskedJWTSecret),
-		zap.String("OracleConnString", maskedOracleConn),
-		zap.Int("OracleMaxPoolOpenConns", cfg.OracleMaxPoolOpenConns),
-		zap.Int("OracleMaxPoolIdleConns", cfg.OracleMaxPoolIdleConns),
-		zap.Int("OracleMaxPoolConnLifetimeMinutes", cfg.OracleMaxPoolConnLifetimeMinutes),
-		zap.Int("OracleMaxPoolConnIdleTimeMinutes", cfg.OracleMaxPoolConnIdleTimeMinutes),
-		zap.String("SQLiteDBPath", cfg.SQLiteDBPath),
-		zap.String("LogFilePath", cfg.LogFilePath),
-		zap.String("LogLevel", cfg.LogLevel),
-		zap.Int("LogMaxSizeMB", cfg.LogMaxSize),
-		zap.Int("LogMaxBackups", cfg.LogMaxBackups),
-		zap.Int("LogMaxAgeDays", cfg.LogMaxAge),
-		zap.Bool("LogCompress", cfg.LogCompress),
-		zap.Duration("LogBatchInterval", cfg.LogBatchInterval),
-		zap.Int("LogProcessorBatchSize", cfg.LogProcessorBatchSize),
-		zap.Int("LogProcessorOracleRetryAttempts", cfg.LogProcessorOracleRetryAttempts),
-		zap.Int("LogProcessorOracleRetryDelaySeconds", cfg.LogProcessorOracleRetryDelaySeconds),
-		zap.String("UploadDir", cfg.UploadDir),
-		zap.String("CORSAllowOrigins", cfg.CORSAllowOrigins),
-		zap.String("CORSAllowMethods", cfg.CORSAllowMethods),
-		zap.String("CORSAllowHeaders", cfg.CORSAllowHeaders),
-		zap.Bool("SQLLiteLogEnabled", cfg.SQLLiteLogEnabled),
-		zap.String("SQLLiteLogLevel", cfg.SQLLiteLogLevel),
-	}
-	logger.Debug("Loaded configuration details", fields...)
-}
-
-// maskOracleConnString function remains the same
-func maskOracleConnString(connStr string) string {
-	prefix := "oracle://"
-	if !strings.HasPrefix(connStr, prefix) {
-		return "*** UNKNOWN FORMAT ***"
-	}
-	parts := strings.SplitN(connStr[len(prefix):], "@", 2)
-	if len(parts) < 2 {
-		return connStr
-	}
-	authPart := parts[0]
-	hostPart := parts[1]
-	authParts := strings.SplitN(authPart, ":", 2)
-	user := authParts[0]
-	if len(authParts) < 2 || authParts[1] == "" {
-		return fmt.Sprintf("%s%s@%s", prefix, user, hostPart)
-	}
-	return fmt.Sprintf("%s%s:***MASKED***@%s", prefix, user, hostPart)
 }
