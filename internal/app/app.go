@@ -33,16 +33,19 @@ import (
 
 // Run initializes and starts the application
 func Run() {
-	var fileLogger *zap.Logger   // For console, file
-	var sqliteLogger *zap.Logger // For dedicated SQLite logging
+	var fileLogger *zap.Logger
+	var sqliteLogger *zap.Logger
 	var oracleDB *sql.DB
 	var sqliteDB *sql.DB
 	var cfg *config.Config
 	var err error
-	var appFiber *fiber.App // Renamed to avoid conflict with package name 'app'
+	var appFiber *fiber.App
 	var components *bootstrap.AppComponents
 	var fileSyncer zapcore.WriteSyncer
 	var logRepo repositories.LogRepository
+
+	// <<<< Record start time for App initialization
+	initAppStartTime := time.Now()
 
 	// --- 1. Load Configuration ---
 	tempConfigLogger, _ := zap.NewProduction(zap.ErrorOutput(zapcore.Lock(os.Stderr)))
@@ -145,12 +148,7 @@ func Run() {
 			var e *fiber.Error
 			if errors.As(err, &e) && e != nil {
 				code = e.Code
-			} else if err != nil {
-				lg.Error("Non-fiber error in ErrorHandler", zap.Error(err))
-			} else {
-				lg.Error("ErrorHandler called with nil error")
 			}
-
 			if c == nil {
 				fmt.Println("FATAL: fiber.Ctx is nil in ErrorHandler")
 				return errors.New("internal context error")
@@ -168,7 +166,7 @@ func Run() {
 			if code == fiber.StatusNotFound {
 				lg.Warn("Resource not found", fields...)
 			} else {
-				lg.Error("Unhandled error caught by global ErrorHandler", fields...)
+				lg.Error("Generic ErrorHandler", fields...)
 			}
 			resp := fiber.Map{"error": "An unexpected error occurred"}
 			if cfg != nil && cfg.AppEnv != "production" {
@@ -192,13 +190,13 @@ func Run() {
 
 	// --- 11. Register Middleware ---
 	appFiber.Use(recover.New(recover.Config{
-		EnableStackTrace: cfg.AppEnv != "production",
+		EnableStackTrace: strings.ToLower(cfg.LogLevel) == "debug",
 		StackTraceHandler: func(c *fiber.Ctx, e interface{}) {
 			logger := middleware.GetRequestFileLogger(c)
 			if logger == nil {
 				logger = logging.GetFileLogger()
 			}
-			logger.Error("Panic recovered", zap.Any("panic_value", e), zap.Stack("stacktrace"))
+			logger.Error("Panic recovered", zap.Any("panic_value", e))
 		},
 	}))
 	fileLogger.Info("Configuring CORS", zap.String("origins", cfg.CORSAllowOrigins), zap.String("methods", cfg.CORSAllowMethods), zap.String("headers", cfg.CORSAllowHeaders))
@@ -257,15 +255,20 @@ func Run() {
 	defer cancelServerCtx()
 	serverStopped := make(chan struct{})
 
+	// <<<< Calculate initialization duration >>>>
+	initAppDurationMs := time.Since(initAppStartTime).Milliseconds()
+
 	go func() {
 		defer close(serverStopped)
 		listenAddr := ":" + cfg.Port
+		fileLogger.Info(fmt.Sprintf("Completed initialization application in %d ms.", initAppDurationMs))
 		fileLogger.Info("Starting Fiber server...",
 			zap.String("address", listenAddr),
-			zap.Bool("prefork_enabled", appFiber.Config().Prefork), // Access from appFiber.Config()
+			zap.Bool("prefork_enabled", appFiber.Config().Prefork),
 			zap.Int("pid", os.Getpid()),
 			zap.String("app_env", cfg.AppEnv),
 		)
+
 		if err := appFiber.Listen(listenAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fileLogger.Error("Server listener failed", zap.String("address", listenAddr), zap.Error(err))
 			cancelServerCtx()

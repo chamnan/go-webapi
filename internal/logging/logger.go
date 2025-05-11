@@ -28,20 +28,59 @@ type AppLoggers struct {
 	SQLite *zap.Logger // For dedicated SQLite logging (can be nil if disabled)
 }
 
-// CreateFileConsoleEncoderConfigs remains the same.
+// Custom level encoder function
+func customLevelEncoder(level zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	enc.AppendString("[" + level.CapitalString() + "]") // Format with brackets
+}
+
+// Custom level encoder function with color for console
+func customColorLevelEncoder(level zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	// Using Zap's built-in CapitalColorLevelEncoder as a base and then wrapping with brackets
+	// This requires a bit more finesse or manually implementing color codes.
+	// For simplicity here, we'll create a colored string and then bracket it.
+	// Note: This might not perfectly replicate CapitalColorLevelEncoder's behavior if it does more than just color.
+	var colorPrefix, colorSuffix string
+	switch level {
+	case zapcore.DebugLevel:
+		colorPrefix = "\x1b[35m" // Magenta
+		colorSuffix = "\x1b[0m"
+	case zapcore.InfoLevel:
+		colorPrefix = "\x1b[32m" // Green
+		colorSuffix = "\x1b[0m"
+	case zapcore.WarnLevel:
+		colorPrefix = "\x1b[33m" // Yellow
+		colorSuffix = "\x1b[0m"
+	case zapcore.ErrorLevel:
+		colorPrefix = "\x1b[31m" // Red
+		colorSuffix = "\x1b[0m"
+	case zapcore.DPanicLevel, zapcore.PanicLevel, zapcore.FatalLevel:
+		colorPrefix = "\x1b[31m" // Red
+		colorSuffix = "\x1b[0m"
+	default:
+		colorPrefix = ""
+		colorSuffix = ""
+	}
+	enc.AppendString(colorPrefix + "[" + level.CapitalString() + "]" + colorSuffix)
+}
+
+// CreateFileConsoleEncoderConfigs sets up the encoder configurations.
 func CreateFileConsoleEncoderConfigs() (zapcore.EncoderConfig, zapcore.EncoderConfig) {
 	// Console Encoder (human-readable, colored)
 	consoleEncoderCfg := zap.NewDevelopmentEncoderConfig()
-	consoleEncoderCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	consoleEncoderCfg.EncodeLevel = customColorLevelEncoder // Use custom color level encoder
 	consoleEncoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	consoleEncoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
+	// Ensure the keys for level, time, message etc. are what you expect, or clear them if the custom encoder handles everything.
+	// For console, development config often includes keys like "L?" for level which we are overriding with EncodeLevel.
 
 	// File Encoder
 	fileEncoderCfg := zap.NewProductionEncoderConfig()
-	fileEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+	fileEncoderCfg.EncodeLevel = customLevelEncoder // Use custom level encoder
 	fileEncoderCfg.TimeKey = "timestamp"
-	fileEncoderCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	fileEncoderCfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder // Consistent with your previous setup
 	fileEncoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
+	// The file encoder typically uses keys like "level", "ts", "msg".
+	// customLevelEncoder will format the value for the "level" key.
 
 	return consoleEncoderCfg, fileEncoderCfg
 }
@@ -52,7 +91,7 @@ func InitializeLoggers(cfg *config.Config, logRepo repositories.LogRepository, f
 	appLoggers := &AppLoggers{}
 
 	// --- Initialize File/Console Logger ---
-	var fileLogLevel zapcore.Level // Renamed from mainLogLevel
+	var fileLogLevel zapcore.Level
 	if err := fileLogLevel.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] Invalid LOG_LEVEL '%s' for file/console logger, defaulting to info: %v\n", cfg.LogLevel, err)
 		fileLogLevel = zapcore.InfoLevel
@@ -61,7 +100,14 @@ func InitializeLoggers(cfg *config.Config, logRepo repositories.LogRepository, f
 	consoleEncoderCfg, fileEncoderCfg := CreateFileConsoleEncoderConfigs()
 	consoleSyncer := zapcore.Lock(os.Stdout)
 
+	// For console output, use NewConsoleEncoder which is more human-readable
 	consoleCore := zapcore.NewCore(zapcore.NewConsoleEncoder(consoleEncoderCfg), consoleSyncer, fileLogLevel)
+
+	// For file output, NewJSONEncoder is common for structured logs, but if you want plain text similar to console:
+	// You might want to use NewConsoleEncoder for the file as well if the aim is human-readable text files.
+	// However, your original fileOutputCore used NewConsoleEncoder(fileEncoderCfg).
+	// If you need JSON in file, then it should be zapcore.NewJSONEncoder(fileEncoderCfg).
+	// Sticking to NewConsoleEncoder for file for bracketed output in plain text.
 	fileOutputCore := zapcore.NewCore(zapcore.NewConsoleEncoder(fileEncoderCfg), fileSyncer, fileLogLevel)
 
 	fileAndConsoleLoggerCore := zapcore.NewTee(consoleCore, fileOutputCore)
@@ -81,9 +127,12 @@ func InitializeLoggers(cfg *config.Config, logRepo repositories.LogRepository, f
 			fmt.Fprintf(os.Stderr, "[WARN] Invalid SQLITE_LOG_LEVEL '%s', defaulting to warn: %v\n", cfg.SQLLiteLogLevel, err)
 			sqliteLogLevel = zapcore.WarnLevel
 		}
-		// Use the fileEncoderCfg for SQLite for consistency in JSON structure,
-		// or define a separate one if needed.
-		sqliteEncoderConfig := fileEncoderCfg // Re-using the file encoder config for JSON structure
+		// SQLite logger continues to use JSON encoder as it's for structured data storage.
+		// The bracket formatting is primarily for console/file human-readable output.
+		sqliteEncoderConfig := zap.NewProductionEncoderConfig() // Standard JSON config for SQLite
+		sqliteEncoderConfig.TimeKey = "timestamp"
+		sqliteEncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+		sqliteEncoderConfig.EncodeCaller = zapcore.ShortCallerEncoder
 		sqliteJSONEncoder := zapcore.NewJSONEncoder(sqliteEncoderConfig)
 		sqliteOnlyCore := NewSQLiteCore(sqliteLogLevel, sqliteJSONEncoder, sqliteEncoderConfig, logRepo)
 
@@ -151,7 +200,7 @@ func (c *sqliteCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 
 	logEntry := models.LogEntry{
 		Timestamp: ent.Time.Local(),
-		Level:     ent.Level.String(),
+		Level:     ent.Level.String(), // SQLite stores the plain level string
 		Message:   ent.Message,
 		Fields:    "{}",
 	}

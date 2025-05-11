@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/godror/godror" // Oracle Driver // Make sure this import is correct for your setup
 	"go-webapi/internal/config"
+
+	_ "github.com/godror/godror"
 	"go.uber.org/zap"
 )
 
@@ -34,8 +35,8 @@ func InitOracle(cfg *config.Config, logger *zap.Logger) (*sql.DB, error) {
 	)
 	db.SetMaxOpenConns(cfg.OracleMaxPoolOpenConns)
 	db.SetMaxIdleConns(cfg.OracleMaxPoolIdleConns)
-	db.SetConnMaxLifetime(time.Duration(cfg.OracleMaxPoolConnLifetimeMinutes) * time.Minute) // Convert minutes to duration
-	db.SetConnMaxIdleTime(time.Duration(cfg.OracleMaxPoolConnIdleTimeMinutes) * time.Minute) // Convert minutes to duration
+	db.SetConnMaxLifetime(time.Duration(cfg.OracleMaxPoolConnLifetimeMinutes) * time.Minute)
+	db.SetConnMaxIdleTime(time.Duration(cfg.OracleMaxPoolConnIdleTimeMinutes) * time.Minute)
 	// --- End Pool Configuration ---
 
 	// Optional: Perform an initial ping to check immediate connectivity.
@@ -45,8 +46,8 @@ func InitOracle(cfg *config.Config, logger *zap.Logger) (*sql.DB, error) {
 	cancel() // Release context resources
 
 	if err != nil {
-		// Log a warning but return the db handle anyway, allowing lazy connection.
-		logger.Warn("Initial Oracle DB ping failed, pool created but connection may establish later", zap.Error(err))
+		// Log a Error but return the db handle anyway, allowing lazy connection.
+		logger.Error("Initial Oracle DB ping failed, pool created but connection may establish later", zap.Error(err))
 		// Return the configured pool handle even if the first ping failed.
 		return db, nil
 	}
@@ -55,5 +56,4 @@ func InitOracle(cfg *config.Config, logger *zap.Logger) (*sql.DB, error) {
 	// Return the configured pool handle.
 	return db, nil
 
-	// Removed the internal retry loop and the monitorOracleConnection goroutine.
 }

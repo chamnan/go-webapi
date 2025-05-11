@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go-webapi/internal/models"
+
 	"go.uber.org/zap"
 	// Import driver-specific error details if needed
 	// "github.com/godror/godror"
@@ -120,7 +121,7 @@ func (r *logRepositoryImpl) GetSQLiteLogs(ctx context.Context, limit int) ([]mod
 			if currentLogger != nil {
 				currentLogger.Error("Failed to scan log row from SQLite", zap.Error(errScan))
 			}
-			continue // Or return error, depending on desired strictness
+			return nil, fmt.Errorf("sqlite row scan failed: %w", errScan)
 		}
 		// Attempt to parse timestamp in RFC3339Nano format (common for Zap)
 		// If parsing fails, try other common formats or default to current time.
@@ -141,7 +142,7 @@ func (r *logRepositoryImpl) GetSQLiteLogs(ctx context.Context, limit int) ([]mod
 			}
 			entry.Timestamp = time.Now().UTC() // Fallback to current time
 		} else {
-			entry.Timestamp = parsedTime.Local() // Convert to local if appropriate, or keep as UTC
+			entry.Timestamp = parsedTime.UTC() // Normalize to UTC for consistency
 		}
 
 		if fields.Valid {
@@ -360,13 +361,26 @@ func isConnectionError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	// Add Oracle specific error codes or string checks if available from godror
-	// e.g., ORA-03113: end-of-file on communication channel
-	// e.g., ORA-12541: TNS:no listener
-	// e.g., ORA-12170: TNS:Connect timeout occurred
+
+	// Attempt to check for Oracle specific error codes if using a driver like godror
+	// godror.OraErr has a Code field.
+	type oracleError interface {
+		Code() int
+	}
+	if oraErr, ok := err.(oracleError); ok {
+		// Common Oracle connection-related error codes
+		// List might need adjustment based on specific Oracle versions and configurations
+		switch oraErr.Code() {
+		case 3113, 3114, 12170, 12537, 12541, 12545, 12560: // ORA-03113, ORA-03114, ORA-12170, etc.
+			return true
+		}
+	}
+
+	// Fallback to string matching for broader cases or other drivers
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "ora-03113") ||
 		strings.Contains(errStr, "ora-03114") ||
+		strings.Contains(errStr, "ora-12537") ||
 		strings.Contains(errStr, "ora-12170") ||
 		strings.Contains(errStr, "ora-12541") ||
 		strings.Contains(errStr, "connection refused") ||
